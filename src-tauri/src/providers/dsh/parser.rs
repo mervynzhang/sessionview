@@ -7,8 +7,36 @@
 //!   `$DSH_HOME/sessions/<project-key>/<session-id>/session.jsonl[.zstd]`
 //!   (`DSH_HOME` defaults to `~/.dsh`). The artifact is zstd-compressed JSONL
 //!   when the suffix is `.jsonl.zstd`; uncompressed `.jsonl` is also accepted.
+//!   Newer releases persist versioned artifacts instead
+//!   (`session.v2.jsonl.zstd`, `session.v3.jsonl.zstd`, …); discovery picks
+//!   the highest generation per directory (see `artifact_rank`).
 //! - The first record is the immutable session header
 //!   `{type:"session", version, id, createdAt, cwd?, parentSession?, origin?, agentPreset?, ...}`.
+//!   Headers at version 0–4 share the framing parsed here (`MAX_SUPPORTED_HEADER_VERSION`);
+//!   v2+ sessions additionally carry `isSeeded`/`delegationDepth` and a per-record
+//!   `surfaceOp: "append"` marker on surface events (the default behavior, ignored).
+//! - A seeded (forked) session starts with a copy of its parent's history: the
+//!   first `seedLength` events (v0/v1 header) or every event before the last
+//!   `session/end-seed` tagged `inherited: true` (v2+). That prefix still renders,
+//!   but its usage is the parent's — already counted there — so it is not
+//!   counted again.
+//! - `compaction/prune` is a shadow-price row metering the node that the
+//!   `surfaceOp: replace` event right after it rewrites; it is log-only.
+//! - v4 lifts `tool/result` out of its `tool-result` wrapper block: the message
+//!   has `role: "tool"`, the result blocks as its own `content`, and
+//!   `toolCallId` / `isError` beside them.
+//! - v2+ sessions never emit `assistant/chunk` rows: failed model calls are recorded
+//!   as `assistant/attempt` events (usage + `finish` error chunks only, no text
+//!   deltas — nothing to reconstruct), and parallel-tool detail rides
+//!   `tool/ptc-dispatch[-start]` rows that duplicate their parent `tool/call` +
+//!   `tool/result` pair. All three are log-only, as are `workspace/changes`,
+//!   `model/selection`, `session-log-deepseek/delivery-accepted`, the renamed
+//!   `approval/asked` + `approval/decided` pair, and `activity/status`.
+//! - `system/message` carries the session's system prompt and v4 `developer/message`
+//!   the tool-availability changes. Both are dropped like the other
+//!   system-injected context dumps: harness context, not conversation.
+//! - `deliverables/presented` lists files the harness presented to the user;
+//!   it surfaces as a tagged System line following the subagent-report convention.
 //! - Every following record is a session event `{type, seq, time, data}` or a
 //!   packed chunk row (`text-chunks` / `reasoning-chunks` / `tool-call-chunks`)
 //!   that replays raw stream deltas in one storage line.
@@ -21,17 +49,19 @@
 //! Surface mapping:
 //! - `user/message` whose `source.kind` is `"user"` becomes a User message.
 //!   Workspace-instruction dumps (`source.kind == "agent-instructions"`) and
-//!   runtime-context snapshots (`source.kind == "plugin"` with
-//!   `form == "snapshot"`/`"instructions"`) are system-injected context, not
-//!   conversation — the DSH GUI collapses them, so we drop them. Every other
-//!   surfaced user-role message (approval-policy changes, goal rounds, cron
-//!   notices, …) renders as a System line.
+//!   any producer's context dump (`form` of `snapshot`, `instructions`,
+//!   `catalog` or `recall`) are system-injected context, not conversation —
+//!   the DSH GUI collapses them, so we drop them. Every other surfaced
+//!   user-role message (approval-policy changes, goal rounds, relayed agent
+//!   messages, cron notices, …) renders as a System line.
 //! - `assistant/message` blocks: `text` → Assistant message (flushed around
 //!   tool calls), `reasoning` → System `[thinking]` line (Claude convention),
 //!   `tool-call` → Tool message with metadata, `image` → `[Image]` marker.
 //! - `tool/result` content is attached to the Tool message whose `callId` the
 //!   `assistant/message` (or `tool/call`) surfaced; an orphan result creates a
 //!   standalone Tool message.
+//! - A compaction checkpoint (`user/message` from the `compact` producer)
+//!   renders as a `[context_compacted]` System line carrying its summary.
 //! - The creation-time `agentPreset` and later `agent-preset/selected` commits
 //!   fold into `SessionMeta.variant_name`; the later committed selection wins.
 //! - Usage (`assistant/message.usage`) is attached to the event's last
@@ -48,18 +78,15 @@
 //! - A step whose stream never assembled an `assistant/message` (interrupted
 //!   mid-stream) is reconstructed from its buffered chunks at `step/end`
 //!   (or end of file), so crash-orphaned steps still show their partial text.
-//! - Compaction is honored: a surface event carrying
-//!   `surfaceOp: {op: "replace", start, end}` shadows every surface node whose
-//!   seq appears in its `sourceEventSeqs` (the `compaction/*` bracket rows are
-//!   log-only). Shadowed messages are removed from the transcript and the
-//!   replacement's messages take their place. Their token usage is preserved
-//!   in `ParsedSession::usage_events` (DSH's own usage collector also folds
-//!   the whole event stream), and the search `content_text` keeps the old text
-//!   so compacted sessions stay searchable.
+//! - The transcript keeps the complete history. A `surfaceOp: replace` event
+//!   rewrites only the model's context: the nodes it shadows stay in place,
+//!   its own messages appear where it was logged, and a replacement
+//!   `tool/result` (an output trimmed for the model) never overwrites the
+//!   result it shadows.
 //!
 //! Token usage rides `ParsedSession::usage_events` (one row per
-//! `assistant/message` event that reports usage), which keeps stats complete
-//! across compaction; per-message `token_usage` is still attached for display.
+//! `assistant/message` event that reports usage); per-message `token_usage` is
+//! still attached for display.
 //! An event without its own `source.model` falls back to the session-level
 //! model; a row that still lacks a model (or a timestamp) is skipped as a
 //! counted parse warning, never silently.
@@ -86,6 +113,11 @@ const DSH_USAGE_KEYS: UsageKeys = UsageKeys {
     cache_write: &["cacheWriteTokens"],
 };
 
+/// Highest session-header `version` whose format changes this parser handles
+/// (see the module docs). Newer generations still parse best-effort but count
+/// a warning so the UI badges them for review.
+const MAX_SUPPORTED_HEADER_VERSION: i64 = 4;
+
 const MISSING: Value = Value::Null;
 
 #[derive(serde::Deserialize)]
@@ -106,6 +138,9 @@ struct DshHeader {
     origin: Option<String>,
     #[serde(default, rename = "agentPreset")]
     agent_preset: Option<String>,
+    /// v0/v1 seeded sessions: how many leading events are inherited.
+    #[serde(default, rename = "seedLength")]
+    seed_length: Option<u64>,
 }
 
 /// Buffered stream deltas for one step whose `assistant/message` never
@@ -117,10 +152,6 @@ struct StepChunkBuf {
     reasoning: BTreeMap<usize, String>,
     /// Block index → (call id, tool name, joined raw arguments).
     tool_calls: BTreeMap<usize, (String, Option<String>, String)>,
-    /// Seq of the most recent chunk row in this buffer (`seq0` for packed
-    /// rows). Gives chunk-reconstructed messages a provenance so a later
-    /// compaction splice can remove them when it shadows the step.
-    last_seq: Option<u64>,
     /// Last streamed usage chunk for the step. The assembled message's own
     /// usage supersedes it (the buffer is dropped on assembly), so this only
     /// feeds interrupted steps at flush — without it their tokens vanish.
@@ -136,6 +167,9 @@ struct ParseState {
     parse_warning_count: u32,
     /// `toolCallId` → index into `messages` for the surfaced Tool message.
     tool_by_call_id: HashMap<String, usize>,
+    /// Call ids whose result is already shown; a replacement result for one
+    /// of them (an output trimmed for the model) leaves it intact.
+    tool_results: HashSet<String>,
     latest_title: Option<String>,
     first_user_text: Option<String>,
     /// `subagent/descriptor.label`: the delegation name the parent chose.
@@ -152,62 +186,44 @@ struct ParseState {
     /// Steps whose `assistant/message` already assembled; late chunk rows for
     /// them are ignored so an out-of-order log cannot duplicate their text.
     assembled_steps: HashSet<(u32, u32)>,
-    /// Surface-event seq → indices of the messages it produced. Drives
-    /// compaction `replace` splices; rebuilt after every splice.
-    seq_to_messages: HashMap<u64, Vec<usize>>,
-    /// Parallel to `messages`: the surface-event seq that produced each
-    /// message (`None` for chunk-reconstructed or orphan messages).
-    message_seq: Vec<Option<u64>>,
-    /// One row per `assistant/message` event that reports usage. Kept even
-    /// when compaction shadows the message, so token stats stay complete
-    /// (DSH's own usage collector folds the whole event stream too).
+    /// One row per `assistant/message` event that reports usage.
     usage_events: Vec<UsageEvent>,
+    /// First seq after a v0/v1 header's inherited prefix, until reached.
+    seed_cut: Option<u64>,
 }
 
 impl ParseState {
-    fn push_user(&mut self, text: String, timestamp: Option<String>, seq: Option<u64>) {
+    fn push_user(&mut self, text: String, timestamp: Option<String>) {
         if self.first_user_text.is_none() {
             self.first_user_text = Some(text.clone());
         }
         self.content_parts.push(text.clone());
-        self.push_with_provenance(
-            Message {
-                timestamp,
-                ..Message::user(text)
-            },
-            seq,
-        );
+        self.messages.push(Message {
+            timestamp,
+            ..Message::user(text)
+        });
     }
 
-    fn push_assistant(
-        &mut self,
-        text: String,
-        model: Option<String>,
-        timestamp: Option<String>,
-        seq: Option<u64>,
-    ) {
+    fn push_assistant(&mut self, text: String, model: Option<String>, timestamp: Option<String>) {
         self.content_parts.push(text.clone());
-        self.push_with_provenance(
-            Message {
-                timestamp,
-                model,
-                ..Message::assistant(text)
-            },
-            seq,
-        );
+        self.messages.push(Message {
+            timestamp,
+            model,
+            ..Message::assistant(text)
+        });
     }
 
-    /// The single append point for `messages`: records the message's
-    /// provenance seq (`None` when the record carried no seq) so
-    /// `message_seq` stays index-parallel with `messages` — the invariant
-    /// compaction splices depend on.
-    fn push_with_provenance(&mut self, message: Message, seq: Option<u64>) {
-        debug_assert_eq!(self.messages.len(), self.message_seq.len());
-        let index = self.messages.len();
-        self.messages.push(message);
-        self.message_seq.push(seq);
-        if let Some(seq) = seq {
-            self.seq_to_messages.entry(seq).or_default().push(index);
+    /// Everything parsed so far is the parent history a seeded session
+    /// inherited. Its usage is counted on the parent, so drop it here —
+    /// from the per-message display too, since a session without usage
+    /// events falls back to message usage for its stats.
+    fn drop_inherited_usage(&mut self) {
+        self.usage_events.clear();
+        for message in &mut self.messages {
+            message.token_usage = None;
+        }
+        for buf in self.chunk_bufs.values_mut() {
+            buf.usage = None;
         }
     }
 }
@@ -270,14 +286,18 @@ fn scan_records(
         if header.is_none() {
             match serde_json::from_str::<DshHeader>(line) {
                 Ok(parsed) if parsed.kind == "session" => {
-                    if parsed.version.is_some_and(|v| v != 0) {
+                    if parsed
+                        .version
+                        .is_some_and(|v| v > MAX_SUPPORTED_HEADER_VERSION)
+                    {
                         log::warn!(
-                            "DSH session '{}' has format version {:?}; expected 0 — parsing best-effort",
+                            "DSH session '{}' has format version {:?}; tested up to {MAX_SUPPORTED_HEADER_VERSION} — parsing best-effort",
                             path.display(),
                             parsed.version
                         );
                         state.parse_warning_count = state.parse_warning_count.saturating_add(1);
                     }
+                    state.seed_cut = parsed.seed_length.filter(|length| *length > 0);
                     header = Some(parsed);
                 }
                 Ok(parsed) => {
@@ -328,19 +348,13 @@ fn handle_record(record: &Value, state: &mut ParseState) {
         .and_then(Value::as_i64)
         .and_then(epoch_ms_to_rfc3339);
     let data = record.get("data").unwrap_or(&MISSING);
-    // Compaction arrives as a surface event whose `surfaceOp` replaces the
-    // surface nodes whose seqs are cited in `sourceEventSeqs`. The event's
-    // own messages are dispatched normally, then the shadowed messages are
-    // spliced out and the replacement's messages take their place.
-    let replace_seqs: Option<Vec<u64>> = match record.get("surfaceOp") {
-        Some(op) if op.get("op").and_then(Value::as_str) == Some("replace") => record
-            .get("sourceEventSeqs")
-            .and_then(Value::as_array)
-            .map(|seqs| seqs.iter().filter_map(Value::as_u64).collect()),
-        _ => None,
-    };
-    let produced_start = state.messages.len();
     let seq = record.get("seq").and_then(Value::as_u64);
+    if let (Some(cut), Some(seq)) = (state.seed_cut, seq)
+        && seq >= cut
+    {
+        state.seed_cut = None;
+        state.drop_inherited_usage();
+    }
     match event_type {
         "session/title" => {
             if let Some(title) = data.get("title").and_then(Value::as_str)
@@ -349,14 +363,16 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 state.latest_title = Some(title.to_string());
             }
         }
-        "user/message" => handle_user_message(data, state, timestamp, seq),
-        "assistant/message" => handle_assistant_message(data, state, timestamp, seq),
-        "tool/call" => handle_tool_call(data, state, timestamp, seq),
-        "tool/result" => handle_tool_result(data, state, timestamp, seq),
+        "user/message" => handle_user_message(data, state, timestamp),
+        "assistant/message" => handle_assistant_message(data, state, timestamp),
+        "tool/call" => handle_tool_call(data, state, timestamp),
+        "tool/result" => {
+            let replaces =
+                record.pointer("/surfaceOp/op").and_then(Value::as_str) == Some("replace");
+            handle_tool_result(data, state, timestamp, replaces);
+        }
         "assistant/chunk" | "text-chunks" | "reasoning-chunks" | "tool-call-chunks" => {
-            // Packed chunk rows carry `seq0` instead of `seq`.
-            let chunk_seq = seq.or_else(|| record.get("seq0").and_then(Value::as_u64));
-            handle_chunk_event(event_type, data, state, chunk_seq, timestamp.clone());
+            handle_chunk_event(event_type, data, state, timestamp);
         }
         // A delegated (subagent) session opens with its descriptor; the
         // `label` is the delegation name the parent chose — the only
@@ -368,6 +384,51 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 .filter(|label| !label.trim().is_empty())
             {
                 state.descriptor_label = Some(label.to_string());
+            }
+        }
+        // The system prompt and v4 tool-availability changes arrive as
+        // surface events, but they are harness context rather than
+        // conversation — dropped like the context dumps in user/message.
+        "system/message" | "developer/message" => {
+            log::debug!("skipping DSH {event_type} context");
+        }
+        // The last marker tagged `inherited` ends a v2+ seeded session's
+        // copy of its parent's history; untagged markers carry no cut.
+        "session/end-seed" => {
+            if data.get("inherited").and_then(Value::as_bool) == Some(true) {
+                state.drop_inherited_usage();
+            }
+        }
+        // Files the harness presented to the user: surface compactly as a
+        // tagged System line (subagent-report convention), not conversation.
+        "deliverables/presented" => {
+            let files: Vec<String> = data
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|file| {
+                            let path = file.get("path").and_then(Value::as_str)?;
+                            let description = file
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .trim();
+                            if description.is_empty() {
+                                Some(path.to_string())
+                            } else {
+                                Some(format!("{path} — {description}"))
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !files.is_empty() {
+                state.messages.push(Message {
+                    timestamp,
+                    ..Message::system(format!("[deliverables]\n{}", files.join("\n")))
+                });
             }
         }
         "agent-preset/selected" => {
@@ -387,18 +448,21 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 data.get("turn").and_then(Value::as_u64),
                 data.get("step").and_then(Value::as_u64),
             ) {
-                flush_step_chunks(state, turn as u32, step as u32, seq);
+                flush_step_chunks(state, turn as u32, step as u32);
             }
         }
         // Known log-only event families: boundaries, request metadata, chunk
-        // rows, compaction brackets, and informational plugin rows. None
-        // carries surface semantics.
+        // rows, compaction brackets and shadow prices, and informational
+        // plugin rows. None carries surface semantics. The v2+ generation adds
+        // failed-attempt markers (`assistant/attempt`: usage + `finish`-error
+        // chunks only), parallel-tool detail duplicating the parent
+        // `tool/call` pair (`tool/ptc-dispatch[-start]`), and transport/model
+        // bookkeeping.
         "turn/start"
         | "turn/end"
         | "step/start"
         | "request/header"
         | "request/context"
-        | "session/end-seed"
         | "todo/write"
         | "command/run"
         | "command/done"
@@ -412,8 +476,18 @@ fn handle_record(record: &Value, state: &mut ParseState) {
         | "compaction/start"
         | "compaction/end"
         | "compaction/summary"
+        | "compaction/prune"
         | "approval/requested"
         | "approval/resolved"
+        | "approval/asked"
+        | "approval/decided"
+        | "assistant/attempt"
+        | "tool/ptc-dispatch"
+        | "tool/ptc-dispatch-start"
+        | "workspace/changes"
+        | "model/selection"
+        | "session-log-deepseek/delivery-accepted"
+        | "activity/status"
         | "goal/change"
         | "plan/mode"
         | "question/requested"
@@ -438,72 +512,6 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 log::warn!("skipping unknown required DSH event '{unknown}'");
                 state.parse_warning_count = state.parse_warning_count.saturating_add(1);
             }
-        }
-    }
-    if let Some(shadowed_seqs) = replace_seqs {
-        apply_surface_replace(state, produced_start, &shadowed_seqs);
-    }
-}
-
-/// Splice a compaction replacement into the transcript: the messages the
-/// replacement event produced (indices `produced_start..`) take the place of
-/// every message produced by the shadowed seqs.
-fn apply_surface_replace(state: &mut ParseState, produced_start: usize, shadowed_seqs: &[u64]) {
-    debug_assert_eq!(state.messages.len(), state.message_seq.len());
-    let produced: Vec<Message> = state.messages.split_off(produced_start);
-    let produced_seq: Vec<Option<u64>> = state.message_seq.split_off(produced_start);
-    let mut shadowed: Vec<usize> = shadowed_seqs
-        .iter()
-        .filter_map(|seq| state.seq_to_messages.get(seq))
-        .flatten()
-        .copied()
-        .collect();
-    shadowed.sort_unstable();
-    shadowed.dedup();
-    if shadowed.is_empty() {
-        // No shadowed messages matched (e.g. the cited seqs were log-only);
-        // keep the replacement at the end rather than losing it.
-        state.messages.extend(produced);
-        state.message_seq.extend(produced_seq);
-        return;
-    }
-    let insert_at = shadowed[0];
-    let shadowed_set: HashSet<usize> = shadowed.iter().copied().collect();
-    let mut kept = Vec::with_capacity(state.messages.len().saturating_sub(shadowed.len()));
-    let mut kept_seq = Vec::with_capacity(state.message_seq.len().saturating_sub(shadowed.len()));
-    for (index, (message, seq)) in state
-        .messages
-        .drain(..)
-        .zip(state.message_seq.drain(..))
-        .enumerate()
-    {
-        if !shadowed_set.contains(&index) {
-            kept.push(message);
-            kept_seq.push(seq);
-        }
-    }
-    kept.splice(insert_at..insert_at, produced);
-    kept_seq.splice(insert_at..insert_at, produced_seq);
-    state.messages = kept;
-    state.message_seq = kept_seq;
-    rebuild_message_indexes(state);
-}
-
-/// Rebuild the derived index maps after a splice shifted message indices.
-fn rebuild_message_indexes(state: &mut ParseState) {
-    state.tool_by_call_id.clear();
-    state.seq_to_messages.clear();
-    for (index, message) in state.messages.iter().enumerate() {
-        if message.role == MessageRole::Tool
-            && let Some(metadata) = message.tool_metadata.as_ref()
-            && let Some(call_id) = metadata.ids.get("tool_use_id")
-        {
-            state.tool_by_call_id.insert(call_id.clone(), index);
-        }
-    }
-    for (index, seq) in state.message_seq.iter().enumerate() {
-        if let Some(seq) = seq {
-            state.seq_to_messages.entry(*seq).or_default().push(index);
         }
     }
 }
@@ -539,17 +547,17 @@ fn extract_block_text(content: &Value) -> String {
     parts.join("\n")
 }
 
-fn handle_user_message(
-    data: &Value,
-    state: &mut ParseState,
-    timestamp: Option<String>,
-    seq: Option<u64>,
-) {
+fn handle_user_message(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
     let source_kind = data
         .pointer("/source/kind")
         .and_then(Value::as_str)
         .unwrap_or("");
     let form = data.pointer("/source/form").and_then(Value::as_str);
+    // v4 names the compaction producer `compact-checkpoint`; earlier versions
+    // attribute it to the `compact` plugin.
+    let is_checkpoint = source_kind == "compact-checkpoint"
+        || (source_kind == "plugin"
+            && data.pointer("/source/plugin").and_then(Value::as_str) == Some("compact"));
     let text = data
         .get("content")
         .map(extract_block_text)
@@ -559,24 +567,14 @@ fn handle_user_message(
     }
     match source_kind {
         // Direct human prompts are the user's own words.
-        "user" => state.push_user(text, timestamp, seq),
+        "user" => state.push_user(text, timestamp),
         // System-injected context dumps — workspace instructions, runtime
         // snapshots, skill/tool catalogs, relayed or recalled context — are
-        // not conversation; the DSH UI collapses them, so do we.
+        // not conversation; the DSH UI collapses them, so do we. The dump
+        // shape is identified by its `form`, not the producer `kind`
+        // (`plugin`, `runtime-context`, `skill-catalog`, … all qualify).
         "agent-instructions" => {
             log::debug!("skipping DSH agent-instructions user message");
-        }
-        "plugin"
-            if matches!(
-                form,
-                Some("snapshot")
-                    | Some("instructions")
-                    | Some("catalog")
-                    | Some("relay")
-                    | Some("recall")
-            ) =>
-        {
-            log::debug!("skipping DSH plugin {form:?} user message");
         }
         // A background subagent's relayed report. The first block is DSH's
         // boilerplate ("Background subagent <id> reported:") — drop it and
@@ -587,13 +585,10 @@ fn handle_user_message(
                 _ => text.trim(),
             };
             if !body.is_empty() {
-                state.push_with_provenance(
-                    Message {
-                        timestamp,
-                        ..Message::system(format!("[subagent_report] {body}"))
-                    },
-                    seq,
-                );
+                state.messages.push(Message {
+                    timestamp,
+                    ..Message::system(format!("[subagent_report] {body}"))
+                });
             }
         }
         // The settle notice: boilerplate ("Background subagent <id>
@@ -612,26 +607,48 @@ fn handle_user_message(
                 .unwrap_or(body)
                 .trim();
             if !body.is_empty() {
-                state.push_with_provenance(
-                    Message {
-                        timestamp,
-                        ..Message::system(format!("[subagent_settled] {body}"))
-                    },
-                    seq,
-                );
+                state.messages.push(Message {
+                    timestamp,
+                    ..Message::system(format!("[subagent_settled] {body}"))
+                });
             }
+        }
+        // A compaction checkpoint: DSH frames the summary between
+        // `<compacted-summary>` tags behind a model-facing preamble; show
+        // just the summary under the shared compaction marker.
+        _ if is_checkpoint => {
+            let summary = text
+                .split_once("<compacted-summary>")
+                .and_then(|(_, rest)| rest.split_once("</compacted-summary>"))
+                .map_or(text.as_str(), |(summary, _)| summary)
+                .trim();
+            state.messages.push(Message {
+                timestamp,
+                ..Message::system(format!("[context_compacted]\n{summary}"))
+            });
+        }
+        // System-injected context dumps — workspace instructions, runtime
+        // snapshots, skill/tool catalogs, recalled context — are not
+        // conversation; the DSH UI collapses them, so do we. The dump shape is
+        // identified by its `form`, not the producer `kind` (`plugin`,
+        // `runtime-context`, `skill-catalog`, … all qualify).
+        // `relay` is deliberately absent: `subagent-report` (handled above) and
+        // `coordinator` both relay real instructions, which are conversation.
+        _ if matches!(
+            form,
+            Some("snapshot") | Some("instructions") | Some("catalog") | Some("recall")
+        ) =>
+        {
+            log::debug!("skipping DSH {source_kind} {form:?} context dump");
         }
         // Everything else that reaches the surface (policy changes, goal
         // rounds, notices, compaction checkpoints, …) renders as a system
         // line.
         _ => {
-            state.push_with_provenance(
-                Message {
-                    timestamp,
-                    ..Message::system(text)
-                },
-                seq,
-            );
+            state.messages.push(Message {
+                timestamp,
+                ..Message::system(text)
+            });
         }
     }
 }
@@ -648,7 +665,6 @@ fn push_tool_message(
     arguments_raw: &str,
     call_id: Option<&str>,
     timestamp: Option<String>,
-    provenance: Option<u64>,
 ) {
     let metadata = build_tool_metadata(ToolCallFacts {
         provider: Provider::Dsh,
@@ -659,27 +675,19 @@ fn push_tool_message(
     });
     let canonical_name = metadata.canonical_name.clone();
     let idx = state.messages.len();
-    state.push_with_provenance(
-        Message {
-            timestamp,
-            tool_name: Some(canonical_name),
-            tool_input: Some(arguments_raw.to_string()),
-            tool_metadata: Some(metadata),
-            ..Message::new(MessageRole::Tool, String::new())
-        },
-        provenance,
-    );
+    state.messages.push(Message {
+        timestamp,
+        tool_name: Some(canonical_name),
+        tool_input: Some(arguments_raw.to_string()),
+        tool_metadata: Some(metadata),
+        ..Message::new(MessageRole::Tool, String::new())
+    });
     if let Some(call_id) = call_id {
         state.tool_by_call_id.insert(call_id.to_string(), idx);
     }
 }
 
-fn handle_assistant_message(
-    data: &Value,
-    state: &mut ParseState,
-    timestamp: Option<String>,
-    seq: Option<u64>,
-) {
+fn handle_assistant_message(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
     let Some(message) = data.get("message") else {
         return;
     };
@@ -703,13 +711,10 @@ fn handle_assistant_message(
                     if let Some(text) = block.get("text").and_then(Value::as_str)
                         && !text.trim().is_empty()
                     {
-                        state.push_with_provenance(
-                            Message {
-                                timestamp: timestamp.clone(),
-                                ..Message::system(format!("[thinking]\n{text}"))
-                            },
-                            seq,
-                        );
+                        state.messages.push(Message {
+                            timestamp: timestamp.clone(),
+                            ..Message::system(format!("[thinking]\n{text}"))
+                        });
                     }
                 }
                 "text" => {
@@ -722,7 +727,7 @@ fn handle_assistant_message(
                 "tool-call" => {
                     if !text_parts.is_empty() {
                         let text = text_parts.join("\n");
-                        state.push_assistant(text, model.clone(), timestamp.clone(), seq);
+                        state.push_assistant(text, model.clone(), timestamp.clone());
                         text_parts.clear();
                     }
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
@@ -734,7 +739,7 @@ fn handle_assistant_message(
                     }
                     let arguments_raw =
                         block.get("arguments").and_then(Value::as_str).unwrap_or("");
-                    push_tool_message(state, name, arguments_raw, call_id, timestamp.clone(), seq);
+                    push_tool_message(state, name, arguments_raw, call_id, timestamp.clone());
                 }
                 "image" => image_count += 1,
                 other => {
@@ -748,12 +753,11 @@ fn handle_assistant_message(
         text_parts.push("[Image]".to_string());
     }
     if !text_parts.is_empty() {
-        state.push_assistant(text_parts.join("\n"), model.clone(), timestamp.clone(), seq);
+        state.push_assistant(text_parts.join("\n"), model.clone(), timestamp.clone());
     }
     if let Some(usage) = usage {
         // The usage also lands in `usage_events` (copied before the move
-        // below), which survives compaction splices and matches how DSH's
-        // own usage collector folds the log. An event without its own model
+        // below), matching how DSH's own usage collector folds the log. An event without its own model
         // falls back to the session-level model; only when neither exists
         // (or the record has no timestamp to bucket by) is the row skipped,
         // and then as a counted parse warning, never silently.
@@ -791,15 +795,12 @@ fn handle_assistant_message(
                 last.timestamp = timestamp.clone();
             }
         } else {
-            state.push_with_provenance(
-                Message {
-                    timestamp: timestamp.clone(),
-                    token_usage: Some(usage),
-                    model: model.clone(),
-                    ..Message::assistant(String::new())
-                },
-                seq,
-            );
+            state.messages.push(Message {
+                timestamp: timestamp.clone(),
+                token_usage: Some(usage),
+                model: model.clone(),
+                ..Message::assistant(String::new())
+            });
         }
     }
     // The assembled message supersedes the step's raw chunks.
@@ -813,12 +814,7 @@ fn handle_assistant_message(
     }
 }
 
-fn handle_tool_call(
-    data: &Value,
-    state: &mut ParseState,
-    timestamp: Option<String>,
-    seq: Option<u64>,
-) {
+fn handle_tool_call(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
     let Some(call_id) = data.get("callId").and_then(Value::as_str) else {
         return;
     };
@@ -828,36 +824,42 @@ fn handle_tool_call(
     }
     let name = data.get("name").and_then(Value::as_str).unwrap_or("tool");
     let arguments_raw = data.get("arguments").and_then(Value::as_str).unwrap_or("");
-    push_tool_message(state, name, arguments_raw, Some(call_id), timestamp, seq);
+    push_tool_message(state, name, arguments_raw, Some(call_id), timestamp);
 }
 
+/// `replaces`: the record is a surface replacement of an earlier result.
 fn handle_tool_result(
     data: &Value,
     state: &mut ParseState,
     timestamp: Option<String>,
-    seq: Option<u64>,
+    replaces: bool,
 ) {
     let Some(message) = data.get("message") else {
         return;
     };
+    // v4 results are `role: "tool"` messages carrying the result directly;
+    // earlier versions wrap it in the message's single `tool-result` block.
+    let result = if message.get("role").and_then(Value::as_str) == Some("tool") {
+        message
+    } else {
+        message.pointer("/content/0").unwrap_or(&MISSING)
+    };
     let call_id = message
         .pointer("/source/callId")
         .and_then(Value::as_str)
-        .or_else(|| {
-            message
-                .pointer("/content/0/toolCallId")
-                .and_then(Value::as_str)
-        });
-    let block = message
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|blocks| blocks.first());
-    let is_error = block
-        .and_then(|block| block.get("isError"))
+        .or_else(|| result.get("toolCallId").and_then(Value::as_str));
+    if let Some(call_id) = call_id
+        && !state.tool_results.insert(call_id.to_string())
+        && replaces
+    {
+        return;
+    }
+    let is_error = result
+        .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let result_text = block
-        .and_then(|block| block.get("content"))
+    let result_text = result
+        .get("content")
         .map(extract_block_text)
         .unwrap_or_default();
     let result_facts = ToolResultFacts {
@@ -886,22 +888,18 @@ fn handle_tool_result(
     });
     enrich_tool_metadata(&mut metadata, result_facts);
     let canonical_name = metadata.canonical_name.clone();
-    state.push_with_provenance(
-        Message {
-            timestamp,
-            tool_name: Some(canonical_name),
-            tool_metadata: Some(metadata),
-            ..Message::new(MessageRole::Tool, result_text)
-        },
-        seq,
-    );
+    state.messages.push(Message {
+        timestamp,
+        tool_name: Some(canonical_name),
+        tool_metadata: Some(metadata),
+        ..Message::new(MessageRole::Tool, result_text)
+    });
 }
 
 fn handle_chunk_event(
     event_type: &str,
     data: &Value,
     state: &mut ParseState,
-    seq: Option<u64>,
     timestamp: Option<String>,
 ) {
     let (Some(turn), Some(step)) = (
@@ -917,9 +915,6 @@ fn handle_chunk_event(
         return;
     }
     let buf = state.chunk_bufs.entry(key).or_default();
-    if seq.is_some() {
-        buf.last_seq = seq;
-    }
     match event_type {
         "assistant/chunk" => {
             let Some(chunk) = data.get("chunk") else {
@@ -1033,15 +1028,11 @@ fn handle_chunk_event(
 
 /// Flush a step's buffered chunk deltas as transcript messages. Only called
 /// for steps whose `assistant/message` never assembled (interrupted stream);
-/// the normal path removes the buffer when the message arrives. Flushed
-/// messages carry `provenance` (the `step/end` seq, or the buffer's last
-/// chunk-row seq at EOF) so a compaction splice can remove them when it
-/// shadows the step.
-fn flush_step_chunks(state: &mut ParseState, turn: u32, step: u32, provenance: Option<u64>) {
+/// the normal path removes the buffer when the message arrives.
+fn flush_step_chunks(state: &mut ParseState, turn: u32, step: u32) {
     let Some(buf) = state.chunk_bufs.remove(&(turn, step)) else {
         return;
     };
-    let provenance = provenance.or(buf.last_seq);
     let produced_start = state.messages.len();
     let mut indices: Vec<usize> = buf
         .text
@@ -1058,17 +1049,19 @@ fn flush_step_chunks(state: &mut ParseState, turn: u32, step: u32, provenance: O
             .get(&index)
             .filter(|text| !text.trim().is_empty())
         {
-            state.push_with_provenance(Message::system(format!("[thinking]\n{text}")), provenance);
+            state
+                .messages
+                .push(Message::system(format!("[thinking]\n{text}")));
         }
         if let Some(text) = buf.text.get(&index).filter(|text| !text.trim().is_empty()) {
             state.content_parts.push(text.clone());
-            state.push_with_provenance(Message::assistant(text.clone()), provenance);
+            state.messages.push(Message::assistant(text.clone()));
         }
         if let Some((call_id, name, arguments)) = buf.tool_calls.get(&index)
             && !state.tool_by_call_id.contains_key(call_id)
         {
             let name = name.as_deref().unwrap_or("tool");
-            push_tool_message(state, name, arguments, Some(call_id), None, provenance);
+            push_tool_message(state, name, arguments, Some(call_id), None);
         }
     }
     // Mirror the assembled-message path: the step's streamed usage lands in
@@ -1100,13 +1093,10 @@ fn flush_step_chunks(state: &mut ParseState, turn: u32, step: u32, provenance: O
         {
             last.token_usage = Some(usage);
         } else {
-            state.push_with_provenance(
-                Message {
-                    token_usage: Some(usage),
-                    ..Message::assistant(String::new())
-                },
-                provenance,
-            );
+            state.messages.push(Message {
+                token_usage: Some(usage),
+                ..Message::assistant(String::new())
+            });
         }
     }
 }
@@ -1147,12 +1137,16 @@ pub fn parse_session_file(path: &Path) -> Option<ParsedSession> {
     };
     let mut state = ParseState::default();
     let header = scan_records(reader, path, &mut state)?;
+    if state.seed_cut.take().is_some() {
+        // The log ends inside its inherited prefix: nothing is local yet.
+        state.drop_inherited_usage();
+    }
     // Torn logs may lack the closing step/end; flush whatever is left.
     let mut pending_steps: Vec<(u32, u32)> = state.chunk_bufs.keys().copied().collect();
     // Deterministic order: flush in (turn, step) sequence, not HashMap order.
     pending_steps.sort_unstable();
     for (turn, step) in pending_steps {
-        flush_step_chunks(&mut state, turn, step, None);
+        flush_step_chunks(&mut state, turn, step);
     }
     if state.messages.is_empty() {
         log::debug!(
@@ -1279,6 +1273,19 @@ mod tests {
             time,
             &format!(
                 r#"{{"turn":1,"step":1,"message":{{"role":"assistant","content":{content},"source":{{"kind":"model","provider":"opencode-go","model":"deepseek-v4-flash"}},"id":"a{seq}"}}{usage_json}}}"#
+            ),
+        )
+    }
+
+    /// `arguments` is a JSON string literal (quotes included) — DSH stores the
+    /// tool arguments as an escaped string, not an object.
+    fn tool_call_line(seq: u64, time: i64, call_id: &str, name: &str, arguments: &str) -> String {
+        event_line(
+            "tool/call",
+            seq,
+            time,
+            &format!(
+                r#"{{"turn":1,"step":1,"callId":"{call_id}","name":"{name}","arguments":{arguments}}}"#
             ),
         )
     }
@@ -1696,10 +1703,13 @@ mod tests {
     }
 
     #[test]
-    fn compaction_replace_shadows_old_surface_and_keeps_usage() {
-        // Real compaction shape: bracket rows, then a user/message carrying
-        // `surfaceOp: {op: "replace"}` whose sourceEventSeqs cite every
-        // shadowed surface event.
+    fn compaction_keeps_the_shadowed_history_and_marks_the_checkpoint() {
+        // Real compaction shape: bracket rows, then a checkpoint user/message
+        // carrying `surfaceOp: {op: "replace"}` whose sourceEventSeqs cite
+        // every shadowed surface event. The originals stay; the checkpoint
+        // shows its summary under the compaction marker.
+        let framed =
+            r#""Checkpoint preamble.\n\n<compacted-summary>condensed history</compacted-summary>""#;
         let session = parse_lines(&[
             &header_line("/tmp/p"),
             &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""old prompt""#),
@@ -1720,9 +1730,9 @@ mod tests {
                 "compaction/summary",
                 5,
                 2001,
-                r#"{"compactionId":"c-1","sourceCommandId":"cmd-1","summary":[{"type":"text","text":"checkpoint"}]}"#,
+                r#"{"compactionId":"c-1","sourceCommandId":"cmd-1","summary":[{"type":"text","text":"condensed history"}]}"#,
             ),
-            &checkpoint_line(6, 2002, r#""[checkpoint] condensed history""#, &[1, 2, 3]),
+            &checkpoint_line(6, 2002, framed, &[1, 2, 3]),
             &event_line(
                 "compaction/end",
                 7,
@@ -1736,81 +1746,40 @@ mod tests {
                 r#""new prompt after compaction""#,
             ),
         ]);
-        let messages = &session.messages;
-        // Old prompt/answer/tool are gone; checkpoint + new prompt remain.
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, MessageRole::System);
-        assert_eq!(messages[0].content, "[checkpoint] condensed history");
-        assert_eq!(messages[1].role, MessageRole::User);
-        assert_eq!(messages[1].content, "new prompt after compaction");
-        // Shadowed usage survives in usage_events (stats stay complete).
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "old prompt",
+                "old answer",
+                "old output",
+                "[context_compacted]\ncondensed history",
+                "new prompt after compaction",
+            ]
+        );
+        assert_eq!(session.messages[3].role, MessageRole::System);
         assert_eq!(session.usage_events.len(), 1);
         assert_eq!(session.usage_events[0].input_tokens, 300);
-        assert_eq!(session.usage_events[0].output_tokens, 50);
-        // Search text keeps the old content even though it left the transcript.
-        assert!(session.content_text.contains("old answer"));
-        // No warnings from the compaction rows themselves.
         assert_eq!(session.parse_warning_count, 0);
     }
 
     #[test]
-    fn compaction_removes_chunk_reconstructed_shadowed_step() {
-        // An interrupted step (chunks but no assistant/message) inside a
-        // compacted range: its flushed messages carry the step/end seq as
-        // provenance, so the splice removes them along with the rest.
+    fn v4_checkpoints_use_the_compact_checkpoint_source() {
         let session = parse_lines(&[
-            &header_line("/tmp/p"),
+            &versioned_header_line(4, "/tmp/p"),
             &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""old prompt""#),
-            &event_line(
-                "text-chunks",
-                2,
-                1001,
-                r#"{"turn":1,"step":1,"index":0,"dt":[1],"texts":["partial answer"]}"#,
-            ),
-            &event_line("step/end", 3, 1002, r#"{"turn":1,"step":1}"#),
-            &checkpoint_line(4, 2002, r#""[checkpoint] condensed history""#, &[1, 2, 3]),
-            &user_message_line(5, 2004, r#"{"kind":"user"}"#, r#""new prompt""#),
+            r#"{"type":"user/message","seq":2,"time":2000,"surfaceOp":{"op":"replace","startSeq":1,"endSeq":1},"sourceEventSeqs":[1],"data":{"content":[{"type":"text","text":"Preamble.\n\n<compacted-summary>"},{"type":"text","text":"the gist"},{"type":"text","text":"</compacted-summary>"}],"source":{"kind":"compact-checkpoint","compactionId":"c-1"},"role":"user","id":"cp-2"}}"#,
         ]);
-        let messages = &session.messages;
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, MessageRole::System);
-        assert_eq!(messages[0].content, "[checkpoint] condensed history");
-        assert_eq!(messages[1].content, "new prompt");
-    }
-
-    #[test]
-    fn second_compaction_splices_correctly_after_first() {
-        // Two successive compactions: the second cites the first checkpoint's
-        // seq. Regression test for `message_seq` drifting out of parallel
-        // with `messages` — misalignment made the second splice keep the
-        // first checkpoint and remove the wrong messages instead.
-        let session = parse_lines(&[
-            &header_line("/tmp/p"),
-            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""old prompt""#),
-            &assistant_message_line(
-                2,
-                1001,
-                r#"[{"type":"text","text":"old answer"},{"type":"tool-call","id":"call_1","name":"bash","arguments":"{}"}]"#,
-                None,
-            ),
-            &tool_result_line(3, 1002, "call_1", r#""old output""#, false),
-            &checkpoint_line(4, 2000, r#""[checkpoint one]""#, &[1, 2, 3]),
-            &user_message_line(5, 3000, r#"{"kind":"user"}"#, r#""mid prompt""#),
-            &assistant_message_line(6, 3001, r#"[{"type":"text","text":"mid answer"}]"#, None),
-            &checkpoint_line(7, 4000, r#""[checkpoint two]""#, &[4, 5, 6]),
-            &user_message_line(8, 5000, r#"{"kind":"user"}"#, r#""new prompt""#),
-        ]);
-        let messages = &session.messages;
-        assert_eq!(
-            messages.len(),
-            2,
-            "checkpoint two must shadow checkpoint one and the mid turn: {:?}",
-            messages.iter().map(|m| &m.content).collect::<Vec<_>>()
-        );
-        assert_eq!(messages[0].role, MessageRole::System);
-        assert_eq!(messages[0].content, "[checkpoint two]");
-        assert_eq!(messages[1].role, MessageRole::User);
-        assert_eq!(messages[1].content, "new prompt");
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["old prompt", "[context_compacted]\nthe gist"]);
     }
 
     #[test]
@@ -2011,5 +1980,345 @@ mod tests {
         let outcome = provider.scan_incremental(&known).expect("incremental scan");
         assert!(outcome.parsed.is_empty());
         assert_eq!(outcome.unchanged_source_paths.len(), 1);
+    }
+
+    /// A v4 header: the framing v2+ generations share with v0, plus the
+    /// fields newer releases add (`isSeeded`, `delegationDepth`).
+    fn versioned_header_line(version: i64, cwd: &str) -> String {
+        format!(
+            r#"{{"type":"session","version":{version},"id":"{SESSION_ID}","createdAt":1786865077879,"cwd":"{cwd}","isSeeded":false,"delegationDepth":0,"agentPreset":"standard"}}"#
+        )
+    }
+
+    #[test]
+    fn versioned_headers_parse_without_warnings() {
+        for version in [2, 3, 4] {
+            let session = parse_lines(&[
+                &versioned_header_line(version, "/tmp/p"),
+                &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hello v4""#),
+            ]);
+            assert_eq!(session.meta.id, SESSION_ID);
+            assert_eq!(session.messages.len(), 1);
+            assert_eq!(
+                session.parse_warning_count, 0,
+                "v{version} header must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_future_header_version_warns() {
+        let session = parse_lines(&[
+            &versioned_header_line(99, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hello future""#),
+        ]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.parse_warning_count, 1);
+    }
+
+    #[test]
+    fn v2_generation_rows_are_silent() {
+        // Every new row type the v2+ generation adds that carries no
+        // transcript semantics must parse warning-free.
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hello""#),
+            &event_line(
+                "assistant/attempt",
+                2,
+                1001,
+                r#"{"turn":1,"step":1,"stream":[{"type":"chunk","time":1001,"chunk":{"type":"usage","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0}}},{"type":"chunk","time":1001,"chunk":{"type":"finish","reason":{"kind":"error"}}}]}"#,
+            ),
+            &event_line(
+                "tool/ptc-dispatch-start",
+                3,
+                1002,
+                r#"{"rootCallId":"call_1","parentCallId":"call_1","subCallId":"call_1:code:1","name":"bash"}"#,
+            ),
+            &event_line(
+                "tool/ptc-dispatch",
+                4,
+                1003,
+                r#"{"rootCallId":"call_1","parentCallId":"call_1","subCallId":"call_1:code:1","name":"bash","isError":false,"content":[{"type":"text","text":"detail"}]}"#,
+            ),
+            &event_line("workspace/changes", 5, 1004, r#"{"turn":1}"#),
+            &event_line(
+                "model/selection",
+                6,
+                1005,
+                r#"{"provider":"aittest","model":"dsv41"}"#,
+            ),
+            &event_line(
+                "session-log-deepseek/delivery-accepted",
+                7,
+                1006,
+                r#"{"sessionId":"session-x","sessionFormatVersion":4,"throughSeq":6}"#,
+            ),
+            &event_line(
+                "approval/asked",
+                8,
+                1007,
+                r#"{"id":"a-1","toolName":"bash","callId":"call_1","reason":"escalate"}"#,
+            ),
+            &event_line(
+                "approval/decided",
+                9,
+                1008,
+                r#"{"id":"a-1","outcome":"allowed-once"}"#,
+            ),
+            &event_line("activity/status", 10, 1009, r#"{"status":"running"}"#),
+        ]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "hello");
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn system_message_prompt_dump_is_dropped() {
+        // `system/message` carries the session prompt with surfaceOp append;
+        // it is context, not conversation — a prompt-only log yields nothing.
+        let dir = TempDir::new().expect("temp dir must be created");
+        let path = write_log(
+            &dir,
+            "session.jsonl",
+            &[
+                &versioned_header_line(4, "/tmp/p"),
+                r#"{"type":"system/message","seq":1,"time":1000,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"role":"system","content":[{"type":"text","text":"You are a helpful software engineer assistant."}],"source":{"kind":"plugin","plugin":"@deepseek-ai/dsh-system-prompt"},"id":"s1"}}}"#,
+            ],
+        );
+        assert!(parse_session_file(&path).is_none());
+    }
+
+    #[test]
+    fn deliverables_surface_as_tagged_system_row() {
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""write a guide""#),
+            &event_line(
+                "deliverables/presented",
+                2,
+                1001,
+                r#"{"turn":1,"callId":"call_1","files":[{"path":"/tmp/guide.md","description":"Workspace guide"}]}"#,
+            ),
+        ]);
+        assert_eq!(session.messages.len(), 2);
+        let deliverables = &session.messages[1];
+        assert_eq!(deliverables.role, MessageRole::System);
+        assert_eq!(
+            deliverables.content,
+            "[deliverables]\n/tmp/guide.md — Workspace guide"
+        );
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn drops_new_generation_context_dumps_and_keeps_notices() {
+        let session = parse_lines(&[
+            &versioned_header_line(3, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hello""#),
+            &event_line(
+                "user/message",
+                2,
+                1001,
+                r#"{"content":[{"type":"text","text":"snapshot"}],"source":{"kind":"runtime-context","form":"snapshot"},"role":"user","id":"u2"}"#,
+            ),
+            &event_line(
+                "user/message",
+                3,
+                1002,
+                r#"{"content":[{"type":"text","text":"catalog"}],"source":{"kind":"skill-catalog","form":"catalog"},"role":"user","id":"u3"}"#,
+            ),
+            &event_line(
+                "user/message",
+                4,
+                1003,
+                r#"{"content":[{"type":"text","text":"The approval policy changed."}],"source":{"kind":"user-approval"},"role":"user","id":"u4"}"#,
+            ),
+            // A coordinator relay is an injected instruction, not a dump: it
+            // shares `form: "relay"` with subagent reports and must survive.
+            &event_line(
+                "user/message",
+                5,
+                1004,
+                r#"{"content":[{"type":"text","text":"Resume the watch now."}],"source":{"kind":"coordinator","form":"relay","senderSessionId":"session-x"},"role":"user","id":"u5"}"#,
+            ),
+        ]);
+        // Dumps gone; the approval notice and the relay render as System lines.
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].content, "hello");
+        assert_eq!(session.messages[1].role, MessageRole::System);
+        assert_eq!(session.messages[1].content, "The approval policy changed.");
+        assert_eq!(session.messages[2].role, MessageRole::System);
+        assert_eq!(session.messages[2].content, "Resume the watch now.");
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    /// A v4 `tool/result`: the result blocks sit directly on a
+    /// `role: "tool"` message. `envelope` carries extra envelope members
+    /// (e.g. a replacement's `surfaceOp`), each with a leading comma.
+    fn v4_tool_result_line(
+        seq: u64,
+        call_id: &str,
+        text: &str,
+        is_error: bool,
+        envelope: &str,
+    ) -> String {
+        let time = 1000 + seq;
+        format!(
+            r#"{{"type":"tool/result","seq":{seq},"time":{time}{envelope},"data":{{"turn":1,"step":1,"message":{{"id":"r{seq}","role":"tool","toolCallId":"{call_id}","isError":{is_error},"source":{{"kind":"tool","callId":"{call_id}"}},"content":[{{"type":"text","text":{text}}}]}}}}}}"#
+        )
+    }
+
+    fn tool_messages(session: &ParsedSession) -> Vec<&Message> {
+        session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect()
+    }
+
+    #[test]
+    fn v4_tool_results_attach_their_output_and_error_flag() {
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""run both""#),
+            &tool_call_line(2, 1001, "call-ok", "bash", r#""{\"command\":\"ls\"}""#),
+            &tool_call_line(3, 1002, "call-bad", "bash", r#""{\"command\":\"nope\"}""#),
+            &v4_tool_result_line(4, "call-ok", r#""listing""#, false, ""),
+            &v4_tool_result_line(5, "call-bad", r#""nope: not found""#, true, ""),
+        ]);
+        let tools = tool_messages(&session);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].content, "listing");
+        assert_eq!(tools[1].content, "nope: not found");
+        let status = |message: &Message| {
+            message
+                .tool_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.status.clone())
+        };
+        assert_eq!(status(tools[0]).as_deref(), Some("success"));
+        assert_eq!(status(tools[1]).as_deref(), Some("error"));
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn trimmed_tool_result_replacements_keep_the_full_output() {
+        // DSH's tool-result pruner logs a `compaction/prune` shadow price and
+        // then a replacement result trimmed for the model. The transcript
+        // keeps the full output, for a surfaced call and an orphan alike.
+        let trimmed = |seq: u64, call_id: &str, shadowed: u64| {
+            v4_tool_result_line(
+                seq,
+                call_id,
+                r#""full…[pruned]""#,
+                false,
+                &format!(
+                    r#","surfaceOp":{{"op":"replace","startSeq":{shadowed},"endSeq":{shadowed}}},"sourceEventSeqs":[{shadowed}]"#
+                ),
+            )
+        };
+        let prune = |seq: u64, shadowed: u64| {
+            event_line(
+                "compaction/prune",
+                seq,
+                1006,
+                &format!(
+                    r#"{{"shadowedRange":{{"start":{shadowed},"end":{shadowed}}},"shadowedSeqs":[{shadowed}],"shadowedTokenCount":42}}"#
+                ),
+            )
+        };
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""go""#),
+            &tool_call_line(2, 1002, "call-1", "bash", r#""{\"command\":\"ls\"}""#),
+            &v4_tool_result_line(3, "call-1", r#""full output""#, false, ""),
+            &v4_tool_result_line(4, "orphan-1", r#""orphan output""#, false, ""),
+            &assistant_message_line(5, 1005, r#"[{"type":"text","text":"done"}]"#, None),
+            &prune(6, 3),
+            &trimmed(7, "call-1", 3),
+            &prune(8, 4),
+            &trimmed(9, "orphan-1", 4),
+        ]);
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["go", "full output", "orphan output", "done"]);
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn developer_messages_are_dropped_as_context() {
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hello""#),
+            r#"{"type":"developer/message","seq":2,"time":1001,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"id":"d2","role":"developer","source":{"kind":"tool-cordis"},"content":[{"type":"tool-addition","toolName":"bash"}]},"headerSeq":0}}"#,
+        ]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn seeded_sessions_count_only_their_own_usage() {
+        let usage = Some(r#"{"inputTokens":100,"outputTokens":10}"#);
+        let answer = r#"[{"type":"text","text":"answer"}]"#;
+        let fork_header = format!(
+            r#"{{"type":"session","version":4,"id":"{SESSION_ID}","createdAt":1786865077879,"cwd":"/tmp/p","isSeeded":true,"parentSession":"session-parent","delegationDepth":0}}"#
+        );
+        let v0_header = |seed_length: u64| {
+            format!(
+                r#"{{"type":"session","version":0,"id":"{SESSION_ID}","createdAt":1786865077879,"cwd":"/tmp/p","parentSession":"session-parent","seedLength":{seed_length}}}"#
+            )
+        };
+        let inherited = [
+            user_message_line(0, 1000, r#"{"kind":"user"}"#, r#""parent prompt""#),
+            assistant_message_line(1, 1001, answer, usage),
+        ];
+        let local = [
+            user_message_line(3, 2000, r#"{"kind":"user"}"#, r#""fork prompt""#),
+            assistant_message_line(4, 2001, answer, usage),
+        ];
+        let end_seed = |tag: &str| event_line("session/end-seed", 2, 1002, tag);
+
+        let cases = [
+            // v2+: the last marker tagged `inherited` ends the copied prefix.
+            (
+                fork_header,
+                Some(end_seed(r#"{"inherited":true}"#)),
+                true,
+                1,
+            ),
+            // An unseeded session's untagged marker carries no cut.
+            (
+                versioned_header_line(4, "/tmp/p"),
+                Some(end_seed("{}")),
+                true,
+                2,
+            ),
+            // v0/v1: the header's `seedLength` counts the copied events.
+            (v0_header(2), None, true, 1),
+            // A fork with no local events yet inherits everything.
+            (v0_header(2), None, false, 0),
+        ];
+        for (header, marker, with_local, local_usage) in cases {
+            let mut lines: Vec<&str> = vec![&header];
+            lines.extend(inherited.iter().map(String::as_str));
+            lines.extend(marker.as_deref());
+            if with_local {
+                lines.extend(local.iter().map(String::as_str));
+            }
+            let session = parse_lines(&lines);
+            assert_eq!(session.usage_events.len(), local_usage, "{header}");
+            let message_usage = session
+                .messages
+                .iter()
+                .filter(|m| m.token_usage.is_some())
+                .count();
+            assert_eq!(message_usage, local_usage, "{header}");
+            // The inherited prefix still renders.
+            assert_eq!(session.messages[0].content, "parent prompt");
+        }
     }
 }
