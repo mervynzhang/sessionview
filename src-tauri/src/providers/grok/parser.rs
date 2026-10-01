@@ -997,16 +997,20 @@ fn extract_subagent_id(content: &str) -> Option<String> {
 }
 
 /// Decode the percent-encoded cwd grok uses as the per-project directory
-/// name (e.g. `%2Ftmp%2Fdemo` → `/tmp/demo`).
+/// name (e.g. `%2Ftmp%2Fdemo` → `/tmp/demo`). Works on bytes, so a `%`
+/// before a multibyte character never splits it; a malformed escape stays
+/// literal.
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
-            .then(|| u8::from_str_radix(&input[i + 1..i + 3], 16).ok())
-            .flatten();
-        match decoded {
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
             Some(byte) => {
                 out.push(byte);
                 i += 3;
@@ -1093,4 +1097,19 @@ fn interleave_session_notes(mut messages: Vec<Message>, notes: Vec<Message>) -> 
     out.extend(timed);
     out.extend(untimed_notes);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn percent_decode_keeps_malformed_escapes_and_multibyte_text() {
+        assert_eq!(percent_decode("%2Ftmp%2Fdemo"), "/tmp/demo");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        // A `%` before a multibyte character must not split it.
+        assert_eq!(percent_decode("%aé/%E4%BD%A0"), "%aé/你");
+    }
 }
