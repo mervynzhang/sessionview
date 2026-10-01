@@ -108,6 +108,16 @@ instantly visible in both. It binds localhost only by default; to expose it
 beyond localhost, pass `--host 0.0.0.0 --token <secret>` (every API request
 must then carry the token).
 
+### WSL: index your Windows sessions too
+
+`SESSIONVIEW_EXTRA_HOMES` lists more home directories to index alongside your own, so one Linux/WSL process can read the Windows side's tool histories through the mount:
+
+```bash
+SESSIONVIEW_EXTRA_HOMES=/mnt/c/Users/<you> npx sessionview
+```
+
+It is a PATH-style list of absolute paths (`:`-separated; `;` on Windows), read once at startup. Each extra home is read at every tool's default location (`.claude`, `.codex`, `.dsh`, …; OpenCode under `AppData/Local` or `.local/share`); per-tool overrides such as `$DSH_HOME`, `$COPILOT_HOME`, or `$MINIMAX_DATA_DIR` apply to your own home only. A session present in more than one home is indexed once. Set the variable for every SessionView process sharing the index — a process without it keeps the other homes' sessions but no longer refreshes them.
+
 ## Quick Start
 
 1. Install and open SessionView

@@ -56,6 +56,18 @@ impl OpenCodeProvider {
         })
     }
 
+    /// Providers for `home`'s OpenCode databases. OpenCode keeps its data in
+    /// `AppData/Local/opencode` on Windows and `.local/share/opencode`
+    /// elsewhere, and a mounted home may come from either OS; a missing
+    /// database scans as empty.
+    pub(crate) fn for_home(home: &Path) -> [Self; 2] {
+        [
+            home.join("AppData").join("Local"),
+            home.join(".local").join("share"),
+        ]
+        .map(|base| Self::with_db_path(base.join("opencode").join("opencode.db")))
+    }
+
     /// Construct a provider pointing at an explicit DB path. Used in tests.
     pub fn with_db_path(db_path: PathBuf) -> Self {
         Self { db_path }

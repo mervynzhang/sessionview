@@ -1,5 +1,6 @@
 use crate::models::Provider;
 
+use super::homes;
 use super::{ProviderDescriptor, SessionProvider};
 
 struct ProviderCatalogEntry {
@@ -10,61 +11,88 @@ struct ProviderCatalogEntry {
     build_runtime: fn() -> Option<Box<dyn SessionProvider>>,
 }
 
+// Each runtime is the provider's primary instance plus its instances for the
+// configured extra homes (`homes::runtime`).
+
 fn build_claude_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::claude::ClaudeProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::claude::ClaudeProvider;
+    homes::runtime(ClaudeProvider::new(), |home| {
+        [ClaudeProvider::with_home(home.to_path_buf())]
+    })
 }
 
 fn build_codex_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::codex::CodexProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::codex::CodexProvider;
+    homes::runtime(CodexProvider::new(), |home| {
+        [CodexProvider::with_home(home.to_path_buf())]
+    })
 }
 
 fn build_antigravity_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::antigravity::AntigravityProvider::new()
-        .map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::antigravity::AntigravityProvider;
+    homes::runtime(AntigravityProvider::new(), |home| {
+        [AntigravityProvider::with_home(home.to_path_buf())]
+    })
 }
 
 fn build_opencode_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::opencode::OpenCodeProvider::new()
-        .map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::opencode::OpenCodeProvider;
+    homes::runtime(OpenCodeProvider::new(), OpenCodeProvider::for_home)
 }
 
 fn build_kimi_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::kimi::KimiProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::kimi::KimiProvider;
+    homes::runtime(KimiProvider::new(), |home| [KimiProvider::for_home(home)])
 }
 
 fn build_cursor_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::cursor::CursorProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::cursor::CursorProvider;
+    homes::runtime(CursorProvider::new(), |home| {
+        [CursorProvider::with_home(home.to_path_buf())]
+    })
 }
 
 fn build_cc_mirror_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::cc_mirror::CcMirrorProvider::new()
-        .map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::cc_mirror::CcMirrorProvider;
+    homes::runtime(CcMirrorProvider::new(), |home| {
+        [CcMirrorProvider::for_home(home)]
+    })
 }
 
 fn build_pi_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::pi::PiProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::pi::PiProvider;
+    homes::runtime(PiProvider::new(), |home| {
+        [PiProvider::with_home(home.to_path_buf())]
+    })
 }
 
 fn build_grok_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::grok::GrokProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::grok::GrokProvider;
+    homes::runtime(GrokProvider::new(), |home| [GrokProvider::for_home(home)])
 }
 
 fn build_dsh_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::dsh::DshProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::dsh::DshProvider;
+    homes::runtime(DshProvider::new(), |home| [DshProvider::for_home(home)])
 }
 
 fn build_mcode_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::mcode::McodeProvider::new().map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::mcode::McodeProvider;
+    homes::runtime(McodeProvider::new(), |home| [McodeProvider::for_home(home)])
 }
 
 fn build_copilot_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::copilot::CopilotProvider::new()
-        .map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::copilot::CopilotProvider;
+    homes::runtime(CopilotProvider::new(), |home| {
+        [CopilotProvider::for_home(home)]
+    })
 }
 
 fn build_commandcode_runtime() -> Option<Box<dyn SessionProvider>> {
-    crate::providers::commandcode::CommandCodeProvider::new()
-        .map(|p| Box::new(p) as Box<dyn SessionProvider>)
+    use crate::providers::commandcode::CommandCodeProvider;
+    homes::runtime(CommandCodeProvider::new(), |home| {
+        [CommandCodeProvider::for_home(home)]
+    })
 }
 
 fn provider_entry(provider: &Provider) -> &'static ProviderCatalogEntry {

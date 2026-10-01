@@ -44,8 +44,12 @@ pub struct AntigravityProvider {
 
 impl AntigravityProvider {
     pub fn new() -> Option<Self> {
-        let home_dir = dirs::home_dir()?;
-        Some(Self { home_dir })
+        dirs::home_dir().map(Self::with_home)
+    }
+
+    /// Provider for `home`'s `.gemini` tree.
+    pub fn with_home(home_dir: PathBuf) -> Self {
+        Self { home_dir }
     }
 
     fn brain_dir(&self) -> PathBuf {

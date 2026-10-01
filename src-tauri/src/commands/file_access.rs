@@ -1,21 +1,19 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 
 use crate::error::CommandResult;
+use crate::provider::homes;
 
 use super::AppState;
 
-/// Session images must live under the user home or system temp.
-fn read_image_canonical_allowed(canonical: &Path) -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return tmp_dir_allows_image(canonical);
-    };
-    if canonical_under_home(canonical, &home) {
-        return true;
-    }
-    tmp_dir_allows_image(canonical)
+/// Session images must live under an indexed home or system temp.
+fn read_image_canonical_allowed(canonical: &Path, homes: &[PathBuf]) -> bool {
+    homes
+        .iter()
+        .any(|home| canonical_under_home(canonical, home))
+        || tmp_dir_allows_image(canonical)
 }
 
 /// Whether `canonical` lies under the user's profile directory.
@@ -88,9 +86,9 @@ fn read_image_base64_sync(path: &str) -> CommandResult<String> {
     let canonical = resolved
         .canonicalize()
         .with_context(|| format!("failed to resolve image path {}", resolved.display()))?;
-    if !read_image_canonical_allowed(&canonical) {
+    if !read_image_canonical_allowed(&canonical, &homes::all_homes()) {
         log::warn!(
-            "read_image_base64 denied (not under home/temp): {}",
+            "read_image_base64 denied (not under an indexed home or temp): {}",
             canonical.display()
         );
         return Err(anyhow!("image path not allowed: {path}").into());
@@ -140,23 +138,24 @@ fn read_image_within(canonical: &Path, max_bytes: u64) -> CommandResult<String> 
 
 const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
-fn read_tool_result_canonical_allowed(canonical: &Path) -> bool {
-    if !canonical
-        .components()
-        .any(|component| component.as_os_str() == "tool-results")
-    {
-        return false;
-    }
-
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    [home.join(".claude"), home.join(".cc-mirror")]
+/// Whether `canonical` lies under a home's `.claude` or `.cc-mirror` tree,
+/// where Claude Code and its mirrors keep tool-result and persisted-output
+/// files.
+fn under_claude_trees(canonical: &Path, homes: &[PathBuf]) -> bool {
+    homes
         .iter()
+        .flat_map(|home| [home.join(".claude"), home.join(".cc-mirror")])
         .any(|base| match base.canonicalize() {
             Ok(base) => canonical.starts_with(base),
             Err(_) => canonical.starts_with(base),
         })
+}
+
+fn read_tool_result_canonical_allowed(canonical: &Path, homes: &[PathBuf]) -> bool {
+    canonical
+        .components()
+        .any(|component| component.as_os_str() == "tool-results")
+        && under_claude_trees(canonical, homes)
 }
 
 pub async fn read_tool_result_text(path: String) -> CommandResult<String> {
@@ -171,18 +170,6 @@ pub async fn resolve_persisted_output(path: String, state: AppState) -> CommandR
     super::blocking(move || resolve_persisted_output_sync(&path, &state)).await
 }
 
-fn persisted_output_canonical_allowed(canonical: &Path) -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    [home.join(".claude"), home.join(".cc-mirror")]
-        .iter()
-        .any(|base| match base.canonicalize() {
-            Ok(b) => canonical.starts_with(&b),
-            Err(_) => canonical.starts_with(base),
-        })
-}
-
 fn resolve_persisted_output_sync(path: &str, state: &AppState) -> CommandResult<String> {
     let path = path.trim().trim_start_matches('\u{feff}').to_string();
     let p = Path::new(&path);
@@ -194,9 +181,9 @@ fn resolve_persisted_output_sync(path: &str, state: &AppState) -> CommandResult<
         .canonicalize()
         .with_context(|| format!("failed to resolve persisted output '{path}'"))?;
 
-    if !persisted_output_canonical_allowed(&canonical) {
+    if !under_claude_trees(&canonical, &homes::all_homes()) {
         log::warn!(
-            "resolve_persisted_output denied (outside ~/.claude or ~/.cc-mirror): {}",
+            "resolve_persisted_output denied (outside the .claude/.cc-mirror trees): {}",
             canonical.display()
         );
         return Err(anyhow!("persisted output path not allowed: {path}").into());
@@ -221,7 +208,7 @@ fn read_tool_result_text_sync(path: &str) -> CommandResult<String> {
     let canonical = p
         .canonicalize()
         .with_context(|| format!("failed to resolve tool result '{path}'"))?;
-    if !read_tool_result_canonical_allowed(&canonical) {
+    if !read_tool_result_canonical_allowed(&canonical, &homes::all_homes()) {
         log::warn!(
             "read_tool_result_text denied (outside tool-results): {}",
             canonical.display()
@@ -264,11 +251,14 @@ fn open_in_folder_sync(path: &str) -> CommandResult<()> {
     if !p.exists() {
         return Err(anyhow!("path not found: {path}").into());
     }
-    // Validate path is under HOME to prevent opening arbitrary system directories
+    // Validate path is under an indexed home to prevent opening arbitrary
+    // system directories
     let canonical = p
         .canonicalize()
         .with_context(|| format!("failed to resolve path '{path}'"))?;
-    let home_ok = dirs::home_dir().is_some_and(|h| canonical.starts_with(&h));
+    let home_ok = homes::all_homes()
+        .iter()
+        .any(|home| canonical.starts_with(home));
     if !home_ok {
         return Err(anyhow!("path not allowed: {path}").into());
     }
@@ -298,7 +288,44 @@ fn open_in_folder_sync(path: &str) -> CommandResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_IMAGE_BYTES, read_image_within};
+    use std::path::{MAIN_SEPARATOR_STR, Path};
+
+    use super::{
+        MAX_IMAGE_BYTES, read_image_canonical_allowed, read_image_within,
+        read_tool_result_canonical_allowed, under_claude_trees,
+    };
+
+    #[test]
+    fn every_indexed_home_is_allowlisted() {
+        let root = Path::new(MAIN_SEPARATOR_STR).join("sessionview-allowlist");
+        let (home, extra) = (root.join("home"), root.join("extra"));
+        let only_home = [home.clone()];
+        let both = [home, extra.clone()];
+        let claude = extra.join(".claude").join("projects").join("p");
+
+        let image = claude.join("shot.png");
+        assert!(!read_image_canonical_allowed(&image, &only_home));
+        assert!(read_image_canonical_allowed(&image, &both));
+
+        let tool_result = claude.join("tool-results").join("call.txt");
+        assert!(!read_tool_result_canonical_allowed(
+            &tool_result,
+            &only_home
+        ));
+        assert!(read_tool_result_canonical_allowed(&tool_result, &both));
+        assert!(!read_tool_result_canonical_allowed(
+            &claude.join("call.txt"),
+            &both
+        ));
+
+        let persisted = extra.join(".cc-mirror").join("v").join("out.txt");
+        assert!(!under_claude_trees(&persisted, &only_home));
+        assert!(under_claude_trees(&persisted, &both));
+        assert!(!under_claude_trees(
+            &extra.join("notes").join("out.txt"),
+            &both
+        ));
+    }
 
     fn png_bytes() -> Vec<u8> {
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];

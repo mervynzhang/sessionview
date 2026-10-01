@@ -31,7 +31,7 @@
 pub(crate) mod parser;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -68,11 +68,15 @@ pub struct CopilotProvider {
 
 impl CopilotProvider {
     pub fn new() -> Option<Self> {
-        let copilot_home = std::env::var_os("COPILOT_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".copilot")))?;
-        Some(Self::with_root(copilot_home))
+        match std::env::var_os("COPILOT_HOME").filter(|value| !value.is_empty()) {
+            Some(copilot_home) => Some(Self::with_root(PathBuf::from(copilot_home))),
+            None => dirs::home_dir().map(|home| Self::for_home(&home)),
+        }
+    }
+
+    /// Provider for `home`'s `.copilot` tree.
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::with_root(home.join(".copilot"))
     }
 
     /// Test constructor: point the provider at an arbitrary `.copilot` root.

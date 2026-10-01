@@ -62,7 +62,11 @@ fn resolve_data_root(
     if let Some(custom) = custom {
         return Some(PathBuf::from(custom).join("v2"));
     }
-    Some(home?.join(".minimax").join("v2"))
+    Some(home_data_root(&home?))
+}
+
+fn home_data_root(home: &Path) -> PathBuf {
+    home.join(".minimax").join("v2")
 }
 
 pub(crate) struct Descriptor;
@@ -106,6 +110,11 @@ impl McodeProvider {
             data_root,
             jsonl_paths: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Provider for `home`'s `.minimax` tree.
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::with_data_root(home_data_root(home))
     }
 
     /// Test constructor: point the provider at an arbitrary data root.

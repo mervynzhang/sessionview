@@ -1,7 +1,7 @@
 pub(crate) mod parser;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use walkdir::WalkDir;
@@ -71,10 +71,15 @@ pub struct DshProvider {
 
 impl DshProvider {
     pub fn new() -> Option<Self> {
-        let home_dir = std::env::var_os("DSH_HOME")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".dsh")))?;
-        Some(Self { home_dir })
+        match std::env::var_os("DSH_HOME").filter(|value| !value.is_empty()) {
+            Some(dsh_home) => Some(Self::with_home(PathBuf::from(dsh_home))),
+            None => dirs::home_dir().map(|home| Self::for_home(&home)),
+        }
+    }
+
+    /// Provider for `home`'s `.dsh` tree.
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::with_home(home.join(".dsh"))
     }
 
     /// Test constructor: point the provider at a fake DSH home directory.

@@ -35,10 +35,12 @@ pub struct GrokProvider {
 
 impl GrokProvider {
     pub fn new() -> Option<Self> {
-        let home_dir = dirs::home_dir()?;
-        Some(Self {
-            grok_dir: home_dir.join(".grok"),
-        })
+        dirs::home_dir().map(|home| Self::for_home(&home))
+    }
+
+    /// Provider for `home`'s `.grok` tree.
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::with_root(home.join(".grok"))
     }
 
     /// Build a provider rooted at an arbitrary directory instead of

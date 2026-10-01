@@ -66,7 +66,12 @@ pub(crate) struct CommandCodeProvider {
 
 impl CommandCodeProvider {
     pub(crate) fn new() -> Option<Self> {
-        dirs::home_dir().map(|home| Self::with_root(home.join(".commandcode")))
+        dirs::home_dir().map(|home| Self::for_home(&home))
+    }
+
+    /// Provider for `home`'s `.commandcode` tree.
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::with_root(home.join(".commandcode"))
     }
 
     pub(crate) fn with_root(commandcode_home: PathBuf) -> Self {

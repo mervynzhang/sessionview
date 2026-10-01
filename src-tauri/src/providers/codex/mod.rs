@@ -43,8 +43,12 @@ pub struct CodexProvider {
 
 impl CodexProvider {
     pub fn new() -> Option<Self> {
-        let home_dir = dirs::home_dir()?;
-        Some(Self { home_dir })
+        dirs::home_dir().map(Self::with_home)
+    }
+
+    /// Provider for `home`'s `.codex` tree.
+    pub fn with_home(home_dir: PathBuf) -> Self {
+        Self { home_dir }
     }
 
     fn sessions_dir(&self) -> PathBuf {

@@ -24,6 +24,16 @@ launcher checks for newer releases on startup and downloads them automatically
 | `--data-dir <dir>` | `~/.sessionview` | Override the data directory |
 | `--open` | — | Open the browser after startup |
 
+## WSL: include your Windows sessions
+
+`SESSIONVIEW_EXTRA_HOMES` names more home directories to index alongside your own (a PATH-style list of absolute paths), so one WSL process can read the Windows side through the mount:
+
+```bash
+SESSIONVIEW_EXTRA_HOMES=/mnt/c/Users/<you> npx sessionview
+```
+
+Every tool is read at its default location under each extra home; per-tool overrides such as `$DSH_HOME` or `$COPILOT_HOME` apply to your own home only.
+
 ## How the binary is resolved
 
 1. Newest released version (npm registry check; skipped when offline).

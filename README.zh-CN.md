@@ -107,6 +107,16 @@ Headless 服务与桌面应用共用同一个 Rust 核心、同一套 UI 和同�
 localhost；如需对外暴露，请加 `--host 0.0.0.0 --token <secret>`（此后每个
 API 请求都必须携带该 token）。
 
+### WSL：同时索引 Windows 侧会话
+
+`SESSIONVIEW_EXTRA_HOMES` 列出要和你自己的主目录一起索引的其他主目录，这样一个 Linux/WSL 进程就能通过挂载路径读取 Windows 侧的工具历史：
+
+```bash
+SESSIONVIEW_EXTRA_HOMES=/mnt/c/Users/<you> npx sessionview
+```
+
+它是 PATH 风格的绝对路径列表（以 `:` 分隔；Windows 上为 `;`），在启动时读取一次。每个额外主目录都按各工具的默认位置读取（`.claude`、`.codex`、`.dsh` 等；OpenCode 位于 `AppData/Local` 或 `.local/share`）；`$DSH_HOME`、`$COPILOT_HOME`、`$MINIMAX_DATA_DIR` 等单工具覆盖只作用于你自己的主目录。同一会话出现在多个主目录时只索引一次。共用同一索引的每个 SessionView 进程都应设置该变量——未设置的进程会保留其他主目录的会话，但不再刷新它们。
+
 ## 快速开始
 
 1. 安装并启动 SessionView

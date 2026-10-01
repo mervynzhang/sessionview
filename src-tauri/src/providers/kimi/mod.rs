@@ -2,7 +2,7 @@ pub mod parser;
 mod tools;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use walkdir::WalkDir;
@@ -50,10 +50,12 @@ pub struct KimiProvider {
 
 impl KimiProvider {
     pub fn new() -> Option<Self> {
-        let home_dir = dirs::home_dir()?;
-        Some(Self {
-            kimi_dir: home_dir.join(".kimi-code"),
-        })
+        dirs::home_dir().map(|home| Self::for_home(&home))
+    }
+
+    /// Provider for `home`'s `.kimi-code` tree.
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::with_root(home.join(".kimi-code"))
     }
 
     /// Build a provider rooted at an arbitrary directory instead of
