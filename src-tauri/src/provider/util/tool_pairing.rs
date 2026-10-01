@@ -14,8 +14,7 @@ use crate::models::Message;
 ///
 /// `register` when the tool-call message is pushed; `message_mut` (or
 /// `index_of`) when its result arrives. Lookups are bounds-checked
-/// against the message list, so parsers that truncate messages (turn
-/// rollback) can also call `retain_below` to drop stale registrations.
+/// against the message list.
 #[derive(Default)]
 pub(crate) struct ToolCallPairer {
     by_call_id: HashMap<String, usize>,
@@ -44,12 +43,6 @@ impl ToolCallPairer {
         messages: &'a mut [Message],
     ) -> Option<&'a mut Message> {
         messages.get_mut(self.index_of(call_id)?)
-    }
-
-    /// Drop registrations pointing at or beyond `len` — used when the
-    /// caller truncates its message list (e.g. turn-cancel rollback).
-    pub(crate) fn retain_below(&mut self, len: usize) {
-        self.by_call_id.retain(|_, idx| *idx < len);
     }
 }
 
@@ -83,15 +76,5 @@ mod tests {
         assert!(pairer.message_mut(Some("ok"), &mut messages).is_some());
         assert!(pairer.message_mut(Some("stale"), &mut messages).is_none());
         assert!(pairer.message_mut(Some("unknown"), &mut messages).is_none());
-    }
-
-    #[test]
-    fn retain_below_drops_rolled_back_registrations() {
-        let mut pairer = ToolCallPairer::default();
-        pairer.register(Some("kept"), 1);
-        pairer.register(Some("dropped"), 2);
-        pairer.retain_below(2);
-        assert_eq!(pairer.index_of(Some("kept")), Some(1));
-        assert_eq!(pairer.index_of(Some("dropped")), None);
     }
 }

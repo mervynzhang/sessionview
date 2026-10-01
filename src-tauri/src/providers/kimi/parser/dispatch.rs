@@ -1,11 +1,13 @@
 //! Accumulator and per-line dispatch — shared between full-file parse
 //! and tail parse.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use crate::models::{Message, MessageRole, Provider, TokenUsage, ToolMetadata};
 use crate::provider::UsageEvent;
-use crate::provider::util::ToolCallPairer;
+use crate::provider::util::{ContentPartsRender, ToolCallPairer, render_content_parts};
 use crate::tool_metadata::{
     ToolCallFacts, ToolResultFacts, attach_call_metadata, build_tool_metadata, enrich_tool_metadata,
 };
@@ -17,14 +19,6 @@ use super::time_ms_to_parts;
 // ---------------------------------------------------------------------------
 // Accumulator: shared per-line state for full-file and tail parse.
 // ---------------------------------------------------------------------------
-
-/// Snapshot of accumulator state at turn boundaries, used to roll back
-/// when a turn is cancelled.
-struct TurnSnapshot {
-    messages_len: usize,
-    content_parts_len: usize,
-    first_user_message: Option<String>,
-}
 
 pub(super) struct ScanAccum {
     pub(super) messages: Vec<Message>,
@@ -57,11 +51,13 @@ pub(super) struct ScanAccum {
     /// later `step.end.usage` replay of the same counts. Reset at `step.begin`.
     current_step_has_authoritative_usage: bool,
     pub(super) parse_warning_count: u32,
-    /// Snapshot of state at the last turn.prompt, used to roll back on
-    /// turn.cancel. protocol_version 1.4+ emits turn.cancel when the
-    /// user interrupts mid-turn; partial transcript content is discarded.
-    turn_snapshot: Option<TurnSnapshot>,
-    pub(super) cancel_without_snapshot: bool,
+    /// Whether the agent's first `turn.prompt` has been seen. A forked agent
+    /// (`/btw`) copies its parent's history before it, so only what follows
+    /// is the agent's own ask.
+    prompted: bool,
+    /// Ids of `context.append_message` messages already rendered. kimi-code
+    /// writes a steering message there and then in `turn.steer`.
+    context_message_ids: HashSet<String>,
     /// Tail windows legitimately start mid-turn, so usage records that
     /// cannot resolve a model or anchor there are expected — don't count
     /// them toward the parse-warning badge.
@@ -87,42 +83,10 @@ impl ScanAccum {
             pending_message_usage: None,
             current_step_has_authoritative_usage: false,
             parse_warning_count: 0,
-            turn_snapshot: None,
-            cancel_without_snapshot: false,
+            prompted: false,
+            context_message_ids: HashSet::new(),
             is_tail: false,
         }
-    }
-
-    /// Capture a snapshot of current state at turn boundary (turn.prompt).
-    fn snapshot_turn(&mut self) {
-        self.finish_pending_usage();
-        self.turn_snapshot = Some(TurnSnapshot {
-            messages_len: self.messages.len(),
-            content_parts_len: self.content_parts.len(),
-            first_user_message: self.first_user_message.clone(),
-        });
-        self.current_step_usage_idx = None;
-        self.current_step_usage_event_idx = None;
-        self.pending_message_usage = None;
-        self.current_step_has_authoritative_usage = false;
-    }
-
-    /// Roll back to the last turn snapshot, discarding everything
-    /// accumulated since the turn started. Called on turn.cancel.
-    fn rollback_turn(&mut self) {
-        let Some(snap) = self.turn_snapshot.take() else {
-            self.cancel_without_snapshot = true;
-            return;
-        };
-        self.messages.truncate(snap.messages_len);
-        self.content_parts.truncate(snap.content_parts_len);
-        // Rebuild call_id_map by keeping only entries whose message still exists.
-        self.call_id_map.retain_below(snap.messages_len);
-        self.first_user_message = snap.first_user_message;
-        self.current_step_usage_idx = None;
-        self.current_step_usage_event_idx = None;
-        self.pending_message_usage = None;
-        self.current_step_has_authoritative_usage = false;
     }
 
     fn note_time(&mut self, ms: Option<i64>) -> Option<String> {
@@ -145,6 +109,27 @@ impl ScanAccum {
         }
         self.last_time_secs = Some(secs);
         Some(rfc)
+    }
+
+    /// A `turn.prompt` opens a turn. Before the agent's first one, every
+    /// message is inherited history, so the title candidate restarts there.
+    fn begin_prompted_turn(&mut self) {
+        if !self.prompted {
+            self.prompted = true;
+            self.first_user_message = None;
+        }
+        self.begin_visible_turn();
+    }
+
+    /// A session fork (`kimi fork`) copies its source's records, usage
+    /// included, and then appends `forked`. That usage is the source's, so
+    /// it is not counted again; the copied transcript stays.
+    fn drop_inherited_usage(&mut self) {
+        self.usage_events.clear();
+        for message in &mut self.messages {
+            message.token_usage = None;
+        }
+        self.begin_visible_turn();
     }
 
     fn begin_visible_turn(&mut self) {
@@ -441,6 +426,36 @@ impl ScanAccum {
         Some(attached)
     }
 
+    /// Count a model call made outside any turn (`usageScope: "session"`:
+    /// compaction, titles, …). It is real spend but belongs to no message,
+    /// so it neither annotates the transcript nor touches step pairing.
+    fn record_session_usage(
+        &mut self,
+        usage: &TokenUsage,
+        timestamp: Option<String>,
+        model: Option<&str>,
+    ) {
+        let (Some(timestamp), Some(model)) = (timestamp, model) else {
+            if !self.is_tail {
+                log::warn!("skipping Kimi session usage record without timestamp or model");
+                self.note_warning();
+            }
+            return;
+        };
+        self.usage_events.push(UsageEvent {
+            timestamp,
+            model: model.to_string(),
+            turn_count: 0,
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            cache_read_input_tokens: u64::from(usage.cache_read_input_tokens),
+            cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
+            usage_hash: None,
+            cost_is_estimate: false,
+            cost_usd: None,
+        });
+    }
+
     pub(super) fn note_warning(&mut self) {
         self.note_warnings(1);
     }
@@ -499,53 +514,35 @@ mod tests;
 // Per-line dispatch — shared between full-file parse and tail parse.
 // ---------------------------------------------------------------------------
 
-/// Pull text out of an assistant content array (Format A `message.content`
-/// or Format B `event.part`/`turn.prompt.input`). Returns plain text and
-/// reformatted image placeholders so the FTS / title heuristics see them
-/// uniformly.
-fn text_from_parts(parts: &[Value]) -> String {
-    let mut chunks: Vec<String> = Vec::new();
-    let has_image = parts
-        .iter()
-        .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image_url"));
-    for part in parts {
-        let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("text");
-        match part_type {
-            "text" => {
-                let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                // Inline `<image path="..">…</image>` wrappers around an
-                // image url were already represented as image_url parts;
-                // drop them to avoid duplicating the marker.
-                if has_image && (text.contains("<image path=") || text.trim() == "</image>") {
-                    continue;
-                }
-                if !text.is_empty() {
-                    chunks.push(text.to_string());
-                }
-            }
-            "image_url" => {
-                // Native kimi-code uses `imageUrl` (camelCase);
-                // migrated wire still uses `image_url` (snake_case).
-                // Accept both so format A/B share one code path.
-                let url = part
-                    .get("imageUrl")
-                    .or_else(|| part.get("image_url"))
-                    .and_then(|iu| iu.get("url"))
-                    .and_then(|v| v.as_str());
-                match url {
-                    Some(url) => chunks.push(format!("[Image: source: {url}]")),
-                    None => {
-                        // URL field missing — surface a marker rather
-                        // than silently dropping the image part.
-                        log::warn!("Kimi image_url part has no resolvable URL");
-                        chunks.push("[Image: source: unknown]".to_string());
-                    }
-                }
-            }
-            _ => {}
+/// Render a content-part array with the shared text/media renderer, so
+/// images, audio, and video all surface as `[Kind: source: …]` markers. A
+/// part type the renderer does not know is skipped with a counted warning.
+fn text_from_parts(accum: &mut ScanAccum, parts: &[Value]) -> String {
+    match render_content_parts(parts) {
+        ContentPartsRender::Rendered(text) => text,
+        ContentPartsRender::Empty => String::new(),
+        ContentPartsRender::Unsupported => {
+            let rendered: Vec<String> = parts
+                .iter()
+                .filter_map(
+                    |part| match render_content_parts(std::slice::from_ref(part)) {
+                        ContentPartsRender::Rendered(text) => Some(text),
+                        ContentPartsRender::Empty => None,
+                        ContentPartsRender::Unsupported => {
+                            let kind = part
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            log::warn!("skipping unsupported Kimi content part '{kind}'");
+                            accum.note_warning();
+                            None
+                        }
+                    },
+                )
+                .collect();
+            rendered.join("\n")
         }
     }
-    chunks.join("\n")
 }
 
 fn handle_turn_ended(accum: &mut ScanAccum, entry: &Value, line_time_ms: Option<i64>) {
@@ -685,9 +682,14 @@ pub(super) fn dispatch_line(accum: &mut ScanAccum, entry: &Value) {
         // ---- Format B: streaming events ----
         "context.append_loop_event" => handle_native_event(accum, entry, line_time_ms),
 
+        // One record per model call, folded additively upstream. `turn`
+        // usage belongs to the current model step; `session` usage is a call
+        // outside any turn. Records without a scope come from releases whose
+        // per-step totals `step.end.usage` already carries.
         "usage.record" => {
             let timestamp = accum.note_time(line_time_ms);
-            if entry.get("usageScope").and_then(Value::as_str) != Some("turn") {
+            let scope = entry.get("usageScope").and_then(Value::as_str);
+            if !matches!(scope, Some("turn" | "session")) {
                 return;
             }
             let model = entry
@@ -696,26 +698,23 @@ pub(super) fn dispatch_line(accum: &mut ScanAccum, entry: &Value) {
                 .filter(|model| !model.is_empty())
                 .map(str::to_string)
                 .or_else(|| accum.current_model.clone());
-            if let Some(u) = entry.get("usage")
-                && let Some(usage) = parse_usage(u)
-                && let Some(total) =
-                    accum.record_usage_event(&usage, timestamp, model.as_deref(), true)
+            let Some(usage) = entry.get("usage").and_then(parse_usage) else {
+                return;
+            };
+            if scope == Some("session") {
+                accum.record_session_usage(&usage, timestamp, model.as_deref());
+            } else if let Some(total) =
+                accum.record_usage_event(&usage, timestamp, model.as_deref(), true)
             {
                 accum.attach_usage(total, model.as_deref(), true);
             }
         }
 
         // ---- Turn boundaries (protocol_version 1.4+) ----
+        // A new turn starts: close the previous turn's usage pairing.
         "turn.prompt" => {
-            // A new turn is starting — snapshot state so we can roll back
-            // if the turn is cancelled.
             let _ = accum.note_time(line_time_ms);
-            accum.snapshot_turn();
-        }
-
-        "turn.cancel" => {
-            let _ = accum.note_time(line_time_ms);
-            accum.rollback_turn();
+            accum.begin_prompted_turn();
         }
 
         // ---- Mid-turn steering (protocol_version 1.4+) ----
@@ -725,12 +724,21 @@ pub(super) fn dispatch_line(accum: &mut ScanAccum, entry: &Value) {
         // must not reset.
         "turn.steer" => {
             let ts = accum.note_time(line_time_ms);
+            // Current kimi-code first writes the steering message as a
+            // `context.append_message` with the same id.
+            if entry
+                .get("messageId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| accum.context_message_ids.contains(id))
+            {
+                return;
+            }
             let Some(parts) = entry.get("input").and_then(Value::as_array) else {
                 log::warn!("Kimi turn.steer without input parts");
                 accum.note_warning();
                 return;
             };
-            let text = text_from_parts(parts);
+            let text = text_from_parts(accum, parts);
             if text.is_empty() {
                 return;
             }
@@ -768,6 +776,19 @@ pub(super) fn dispatch_line(accum: &mut ScanAccum, entry: &Value) {
         // turns are ordinary boundaries, but failures, interruptions, and
         // retries retain their reason/error text in the transcript.
         "turn.ended" => handle_turn_ended(accum, entry, line_time_ms),
+
+        // Undo rewrites only the model's context. The transcript keeps every
+        // message and marks where the context changed.
+        "context.undo" => {
+            let ts = accum.note_time(line_time_ms);
+            let Some(count) = entry.get("count").and_then(Value::as_u64) else {
+                log::warn!("Kimi context.undo without a turn count");
+                accum.note_warning();
+                return;
+            };
+            let detail = format!("undid the last {count} turn(s); they stay above");
+            accum.push_system_context(format!("[kimi_context] undo\n{detail}"), &detail, ts);
+        }
         "turn.step.interrupted" => handle_step_interrupted(accum, entry, line_time_ms),
         "turn.step.retrying" => handle_step_retrying(accum, entry, line_time_ms),
 
@@ -803,7 +824,6 @@ pub(super) fn dispatch_line(accum: &mut ScanAccum, entry: &Value) {
         | "token_counting.rebased"
         | "token_counting.turn_recorded"
         | "plugin.session_start"
-        | "forked"
         | "interaction.request"
         | "interaction.resolved"
         | "task.started"
@@ -819,16 +839,79 @@ pub(super) fn dispatch_line(accum: &mut ScanAccum, entry: &Value) {
         | "tools.register_user_tool"
         | "tools.unregister_user_tool"
         | "tools.reset_active_tools"
-        | "mcp.tools_discovered" => {
+        | "mcp.tools_discovered"
+        // A cancelled turn keeps its partial output, as kimi-code's context
+        // does; its `turn.ended` reason marks the cancellation.
+        | "turn.cancel"
+        // Undo bookkeeping beside `context.undo`: the wire-tree branch edge
+        // and the undone turn range.
+        | "agent.switched"
+        | "context.undone"
+        // The loop engine's journal: turn bookkeeping. Its messages are
+        // handled below.
+        | "agent.turn.started"
+        | "agent.turn.ended"
+        // Subagent lifecycle mirrors in the parent's wire. Each child's
+        // transcript and usage live in its own wire.
+        | "subagent.spawned"
+        | "subagent.started"
+        | "subagent.completed"
+        | "subagent.failed"
+        | "subagent.cancelled"
+        | "file_history.checkpoint"
+        | "file_history.tracked"
+        | "tower_mode.enter"
+        | "tower_mode.exit" => {
             // These are UI/state bookkeeping events; they don't carry
             // messages we want in the transcript. Soak up the time so
             // first/last timestamps still span the whole file.
             let _ = accum.note_time(line_time_ms);
         }
 
+        // The last `forked` closes a session fork's copy of its source.
+        "forked" => {
+            let _ = accum.note_time(line_time_ms);
+            accum.drop_inherited_usage();
+        }
+
+        // The journal mirrors the input, model, and tool messages that the
+        // `context.*` records carry. Only the partial output of an
+        // interrupted model step is journal-only (`source: "salvaged"`).
+        "agent.message.appended" => {
+            let ts = accum.note_time(line_time_ms);
+            if entry.pointer("/message/meta/source").and_then(Value::as_str) == Some("salvaged") {
+                let parts = entry
+                    .pointer("/message/message/content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                push_assistant_parts(accum, &parts, ts);
+            }
+        }
+
         unknown => {
             log::warn!("skipping unknown Kimi record type '{unknown}'");
             accum.note_warning();
+        }
+    }
+}
+
+/// Assistant content parts in order: thinking, text, and media markers.
+fn push_assistant_parts(accum: &mut ScanAccum, parts: &[Value], ts: Option<String>) {
+    for part in parts {
+        match part.get("type").and_then(Value::as_str).unwrap_or("") {
+            "think" => {
+                let text = part.get("think").and_then(Value::as_str).unwrap_or("");
+                accum.push_thinking(text, ts.clone());
+            }
+            "text" => {
+                let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                accum.push_assistant_text(text, ts.clone());
+            }
+            _ => {
+                let text = text_from_parts(accum, std::slice::from_ref(part));
+                accum.push_assistant_text(&text, ts.clone());
+            }
         }
     }
 }
@@ -848,6 +931,9 @@ fn handle_migrated_line(accum: &mut ScanAccum, entry: &Value, line_time_ms: Opti
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    if let Some(id) = message.get("id").and_then(Value::as_str) {
+        accum.context_message_ids.insert(id.to_string());
+    }
     let origin = message.get("origin");
     let origin_kind = origin
         .and_then(|value| value.get("kind"))
@@ -856,7 +942,7 @@ fn handle_migrated_line(accum: &mut ScanAccum, entry: &Value, line_time_ms: Opti
 
     match role {
         "user" => {
-            let text = text_from_parts(&content_array);
+            let text = text_from_parts(accum, &content_array);
             match origin_kind {
                 // Migrated transcripts predate PromptOrigin. A missing origin
                 // there still represents a genuine user prompt.
@@ -1032,34 +1118,21 @@ fn handle_migrated_line(accum: &mut ScanAccum, entry: &Value, line_time_ms: Opti
             // tool calls under message.toolCalls[]. Emit them in
             // the order the on-disk message implies: think/text
             // first, then tool calls.
-            for part in &content_array {
-                let pt = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match pt {
-                    "think" => {
-                        let text = part.get("think").and_then(|v| v.as_str()).unwrap_or("");
-                        accum.push_thinking(text, ts.clone());
-                    }
-                    "text" => {
-                        let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        accum.push_assistant_text(text, ts.clone());
-                    }
-                    _ => {}
-                }
-            }
+            push_assistant_parts(accum, &content_array, ts.clone());
             if let Some(calls) = message.get("toolCalls").and_then(|v| v.as_array()) {
                 for tc in calls {
                     let id = tc.get("id").and_then(|v| v.as_str());
-                    let func = tc.get("function");
-                    let name = func
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
+                    // Wire 1.1 flattened `{function: {name, arguments}}`
+                    // onto the call itself; 1.0 files keep the nested form.
+                    let field = |key: &str| {
+                        tc.get(key)
+                            .or_else(|| tc.get("function").and_then(|f| f.get(key)))
+                    };
+                    let name = field("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                     // Format A serialises args as a JSON string;
                     // try to parse it back into a Value so the
                     // metadata builder can structure-inspect it.
-                    let arg_string = func
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|v| v.as_str());
+                    let arg_string = field("arguments").and_then(|v| v.as_str());
                     let arg_value: Option<Value> =
                         arg_string.and_then(|s| serde_json::from_str::<Value>(s).ok());
                     accum.push_tool_call(name, id, arg_value.as_ref(), ts.clone(), None);
@@ -1104,9 +1177,9 @@ fn handle_native_event(accum: &mut ScanAccum, entry: &Value, line_time_ms: Optio
                     let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     accum.push_assistant_text(text, ts);
                 }
-                unknown => {
-                    log::warn!("skipping unknown Kimi content.part type '{unknown}'");
-                    accum.note_warning();
+                _ => {
+                    let text = text_from_parts(accum, std::slice::from_ref(part));
+                    accum.push_assistant_text(&text, ts);
                 }
             }
         }

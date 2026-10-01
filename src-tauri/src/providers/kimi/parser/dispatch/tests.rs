@@ -1,20 +1,24 @@
 use super::*;
 use crate::models::ToolResultMode;
-use serde_json::json;
+use serde_json::{Value, json};
+
+fn text_part(text: &str) -> Value {
+    json!({
+        "type": "context.append_loop_event",
+        "event": {"type": "content.part", "part": {"type": "text", "text": text}},
+        "time": 1001
+    })
+}
+
+fn contents(accum: &ScanAccum) -> Vec<&str> {
+    accum.messages.iter().map(|m| m.content.as_str()).collect()
+}
 
 #[test]
-fn turn_cancel_discards_content_but_preserves_usage() {
+fn cancelled_turn_keeps_partial_output_and_usage() {
     let mut accum = ScanAccum::new();
-    // Simulate a turn that gets cancelled
     dispatch_line(&mut accum, &json!({"type": "turn.prompt", "time": 1000}));
-    dispatch_line(
-        &mut accum,
-        &json!({
-            "type": "context.append_loop_event",
-            "event": {"type": "content.part", "part": {"type": "text", "text": "partial response..."}},
-            "time": 1001
-        }),
-    );
+    dispatch_line(&mut accum, &text_part("partial response..."));
     dispatch_line(
         &mut accum,
         &json!({
@@ -33,67 +37,23 @@ fn turn_cancel_discards_content_but_preserves_usage() {
             "time": 1002
         }),
     );
-    // User cancels
-    dispatch_line(&mut accum, &json!({"type": "turn.cancel", "time": 1003}));
+    dispatch_line(
+        &mut accum,
+        &json!({"type": "turn.cancel", "turnId": 0, "target": "active", "reason": "user_cancelled", "time": 1003}),
+    );
+    dispatch_line(
+        &mut accum,
+        &json!({"type": "turn.ended", "turnId": 0, "reason": "cancelled", "time": 1004}),
+    );
 
-    assert_eq!(accum.messages.len(), 0);
-    assert_eq!(accum.content_parts.len(), 0);
+    assert_eq!(
+        contents(&accum),
+        ["partial response...", "", "[turn_cancelled]"]
+    );
+    assert_eq!(accum.call_id_map.index_of(Some("tc_1")), Some(1));
     assert_eq!(accum.usage_events.len(), 1);
     assert_eq!(accum.usage_events[0].input_tokens, 10);
-    assert_eq!(accum.usage_events[0].output_tokens, 5);
-    assert_eq!(accum.call_id_map.index_of(Some("tc_1")), None);
-}
-
-#[test]
-fn turn_cancel_preserves_previous_turn() {
-    let mut accum = ScanAccum::new();
-    // First turn completes normally
-    dispatch_line(&mut accum, &json!({"type": "turn.prompt", "time": 1000}));
-    dispatch_line(
-        &mut accum,
-        &json!({
-            "type": "context.append_message",
-            "message": {"role": "user", "content": [{"type": "text", "text": "hello"}], "toolCalls": [], "origin": {"kind": "user"}},
-            "time": 1001
-        }),
-    );
-    dispatch_line(
-        &mut accum,
-        &json!({
-            "type": "context.append_loop_event",
-            "event": {"type": "content.part", "part": {"type": "text", "text": "Hi!"}},
-            "time": 1002
-        }),
-    );
-    dispatch_line(
-        &mut accum,
-        &json!({
-            "type": "usage.record",
-            "model": "kimi-test",
-            "usage": {"inputOther": 10, "output": 5, "inputCacheRead": 0, "inputCacheCreation": 0},
-            "usageScope": "turn",
-            "time": 1003
-        }),
-    );
-
-    // Second turn starts then gets cancelled
-    dispatch_line(&mut accum, &json!({"type": "turn.prompt", "time": 2000}));
-    dispatch_line(
-        &mut accum,
-        &json!({
-            "type": "context.append_loop_event",
-            "event": {"type": "content.part", "part": {"type": "text", "text": "partial..."}},
-            "time": 2001
-        }),
-    );
-    dispatch_line(&mut accum, &json!({"type": "turn.cancel", "time": 2002}));
-
-    // Should still have the first turn's messages
-    assert_eq!(accum.messages.len(), 2); // user + assistant
-    assert_eq!(accum.messages[0].role, MessageRole::User);
-    assert_eq!(accum.messages[0].content, "hello");
-    assert_eq!(accum.messages[1].role, MessageRole::Assistant);
-    assert_eq!(accum.messages[1].content, "Hi!");
+    assert_eq!(accum.parse_warning_count, 0);
 }
 
 #[test]
@@ -844,4 +804,253 @@ fn invalid_metadata_timestamp_is_reported() {
 
     assert_eq!(accum.parse_warning_count, 1);
     assert_eq!(accum.first_time_secs, None);
+}
+
+#[test]
+fn session_scoped_usage_counts_without_annotating_messages() {
+    let mut accum = ScanAccum::new();
+    dispatch_line(&mut accum, &json!({"type": "turn.prompt", "time": 1000}));
+    dispatch_line(&mut accum, &text_part("answer"));
+    // A compaction call outside the turn: real spend, no owning message.
+    dispatch_line(
+        &mut accum,
+        &json!({
+            "type": "usage.record",
+            "model": "kimi-test",
+            "usage": {"inputOther": 700, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0},
+            "usageScope": "session",
+            "time": 1002
+        }),
+    );
+    accum.finish_pending_usage();
+
+    assert_eq!(accum.usage_events.len(), 1);
+    assert_eq!(accum.usage_events[0].input_tokens, 700);
+    assert_eq!(accum.usage_events[0].turn_count, 0);
+    assert!(accum.messages[0].token_usage.is_none());
+    assert_eq!(accum.parse_warning_count, 0);
+}
+
+#[test]
+fn scopeless_usage_records_defer_to_step_end() {
+    let mut accum = ScanAccum::new();
+    dispatch_line(
+        &mut accum,
+        &json!({"type": "config.update", "modelAlias": "kimi-test", "time": 999}),
+    );
+    dispatch_line(&mut accum, &json!({"type": "turn.prompt", "time": 1000}));
+    dispatch_line(&mut accum, &text_part("answer"));
+    dispatch_line(
+        &mut accum,
+        &json!({
+            "type": "usage.record",
+            "model": "kimi-test",
+            "usage": {"inputOther": 10, "output": 5},
+            "time": 1002
+        }),
+    );
+    dispatch_line(
+        &mut accum,
+        &json!({
+            "type": "context.append_loop_event",
+            "event": {"type": "step.end", "usage": {"inputOther": 10, "output": 5}},
+            "time": 1003
+        }),
+    );
+
+    assert_eq!(accum.usage_events.len(), 1);
+    assert_eq!(accum.usage_events[0].input_tokens, 10);
+}
+
+#[test]
+fn undo_marks_the_transcript_and_keeps_history() {
+    let mut accum = ScanAccum::new();
+    dispatch_line(&mut accum, &text_part("first answer"));
+    // What kimi-code 2.1.1 writes for `/undo` of one turn.
+    for record in [
+        json!({"type": "agent.switched", "agentId": "main", "branch": "b1", "reason": "undo", "base": {"branch": "main", "line": 36}, "turns": 1, "legacyUndoLine": 50, "time": 1002}),
+        json!({"type": "context.undo", "agentId": "main", "count": 1, "time": 1002}),
+        json!({"type": "context.undone", "agentId": "main", "turns": 1, "fromTurnId": 1, "time": 1002}),
+        json!({"type": "token_counting.truncated", "agentId": "main", "time": 1002}),
+    ] {
+        dispatch_line(&mut accum, &record);
+    }
+
+    assert_eq!(
+        contents(&accum),
+        [
+            "first answer",
+            "[kimi_context] undo\nundid the last 1 turn(s); they stay above",
+        ]
+    );
+    assert_eq!(accum.parse_warning_count, 0);
+}
+
+#[test]
+fn journal_and_lifecycle_mirrors_are_silent() {
+    let mut accum = ScanAccum::new();
+    for record in [
+        json!({"type": "agent.message.appended", "kind": "event", "message": {"message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}, "meta": {"source": "input"}}, "time": 1000}),
+        json!({"type": "agent.message.appended", "kind": "event", "message": {"message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}], "toolCalls": []}, "meta": {"source": "llm"}}, "time": 1001}),
+        json!({"type": "agent.turn.started", "kind": "event", "turnId": 0, "queueItemId": "q", "time": 1000}),
+        json!({"type": "agent.turn.ended", "kind": "event", "turnId": 0, "outcome": "done", "time": 1001}),
+        json!({"type": "subagent.spawned", "subagentId": "agent-1", "subagentName": "explore", "parentToolCallId": "tc", "parentAgentId": "main", "callerAgentId": "main", "description": "List files", "runInBackground": false, "time": 1001}),
+        json!({"type": "subagent.started", "subagentId": "agent-1", "time": 1001}),
+        json!({"type": "subagent.completed", "subagentId": "agent-1", "resultSummary": "ok", "usage": {"inputOther": 902, "output": 130, "inputCacheRead": 15360, "inputCacheCreation": 0}, "contextTokens": 8295, "time": 1002}),
+        json!({"type": "file_history.checkpoint", "agentId": "main", "turnId": 0, "entries": {}, "time": 1002}),
+        json!({"type": "file_history.tracked", "agentId": "main", "turnId": 0, "path": "a.rs", "entry": {"key": null, "version": 1}, "time": 1002}),
+        json!({"type": "tower_mode.enter", "agentId": "main", "time": 1002}),
+        json!({"type": "tower_mode.exit", "agentId": "main", "time": 1002}),
+    ] {
+        dispatch_line(&mut accum, &record);
+    }
+
+    assert!(accum.messages.is_empty());
+    // A child's usage lives in its own wire; the parent's mirror adds none.
+    assert!(accum.usage_events.is_empty());
+    assert_eq!(accum.parse_warning_count, 0);
+}
+
+#[test]
+fn salvaged_partial_output_of_an_interrupted_step_renders() {
+    // On cancel kimi-code journals the interrupted step's partial output
+    // and writes no `content.part` for it.
+    let mut accum = ScanAccum::new();
+    for record in [
+        json!({"type": "turn.cancel", "agentId": "main", "turnId": 1, "target": "active", "reason": "user_cancelled", "time": 1000}),
+        json!({"type": "context.append_loop_event", "agentId": "main", "event": {"type": "step.end", "turnId": "1", "step": 1, "finishReason": "interrupted"}, "time": 1001}),
+        json!({"type": "turn.step.interrupted", "agentId": "main", "turnId": 1, "step": 1, "reason": "aborted", "time": 1001}),
+        json!({"type": "agent.message.appended", "kind": "event", "message": {"message": {"role": "assistant", "content": [{"type": "think", "think": "The user wants an essay", "reasoningKey": "reasoning_content"}], "toolCalls": []}, "meta": {"model": {"provider": "agent-loop", "model": "agent-loop"}, "source": "salvaged", "usage": {"inputOther": 0, "output": 0, "inputCacheRead": 0, "inputCacheCreation": 0}}}, "time": 1002}),
+        json!({"type": "turn.ended", "agentId": "main", "turnId": 1, "reason": "cancelled", "time": 1003}),
+    ] {
+        dispatch_line(&mut accum, &record);
+    }
+
+    assert_eq!(
+        contents(&accum),
+        [
+            "[step_interrupted] aborted",
+            "[thinking]\nThe user wants an essay",
+            "[turn_cancelled]",
+        ]
+    );
+    assert!(accum.usage_events.is_empty());
+    assert_eq!(accum.parse_warning_count, 0);
+}
+
+#[test]
+fn steering_renders_once() {
+    // kimi-code writes the steering message to context, then `turn.steer`.
+    let mut accum = ScanAccum::new();
+    for record in [
+        json!({"type": "context.append_message", "agentId": "main", "message": {"role": "user", "content": [{"type": "text", "text": "Also mention the year."}], "toolCalls": [], "id": "msg_steer", "origin": {"kind": "user", "inTurn": true}}, "time": 1000}),
+        json!({"type": "turn.steer", "agentId": "main", "input": [{"type": "text", "text": "Also mention the year."}], "origin": {"kind": "user", "inTurn": true}, "messageId": "msg_steer", "promptIds": ["msg_steer"], "turnId": 4, "time": 1000}),
+    ] {
+        dispatch_line(&mut accum, &record);
+    }
+
+    assert_eq!(contents(&accum), ["Also mention the year."]);
+}
+
+#[test]
+fn a_session_fork_counts_only_its_own_usage() {
+    // `kimi fork` copies the source's records, then appends `forked`.
+    let mut accum = ScanAccum::new();
+    let usage = |input: u64, time: i64| json!({"type": "usage.record", "agentId": "main", "model": "kimi-code/k3", "usage": {"inputOther": input, "output": 1, "inputCacheRead": 0, "inputCacheCreation": 0}, "usageScope": "turn", "time": time});
+    for record in [
+        json!({"type": "turn.prompt", "agentId": "main", "turnId": 0, "time": 1000}),
+        text_part("inherited answer"),
+        usage(100, 1002),
+        json!({"type": "forked", "agentId": "main", "time": 2000}),
+        json!({"type": "turn.prompt", "agentId": "main", "turnId": 1, "time": 2001}),
+        text_part("own answer"),
+        usage(7, 2003),
+    ] {
+        dispatch_line(&mut accum, &record);
+    }
+
+    assert_eq!(contents(&accum), ["inherited answer", "own answer"]);
+    assert_eq!(accum.usage_events.len(), 1);
+    assert_eq!(accum.usage_events[0].input_tokens, 7);
+    assert!(accum.messages[0].token_usage.is_none());
+}
+
+#[test]
+fn migrated_tool_calls_accept_both_wire_shapes() {
+    let mut accum = ScanAccum::new();
+    for tool_call in [
+        // Wire 1.0 nests the call under `function`.
+        json!({"type": "function", "id": "tc_old", "function": {"name": "Read", "arguments": "{\"path\":\"a.rs\"}"}}),
+        // Wire 1.1+ (and every forked agent) flattens it.
+        json!({"type": "function", "id": "tc_new", "name": "Grep", "arguments": "{\"pattern\":\"fn\"}"}),
+    ] {
+        dispatch_line(
+            &mut accum,
+            &json!({
+                "type": "context.append_message",
+                "message": {"role": "assistant", "content": [], "toolCalls": [tool_call]},
+                "time": 1000
+            }),
+        );
+    }
+
+    let names: Vec<Option<&str>> = accum
+        .messages
+        .iter()
+        .map(|m| m.tool_name.as_deref())
+        .collect();
+    assert_eq!(names, [Some("Read"), Some("Grep")]);
+    assert_eq!(
+        accum.messages[0].tool_input.as_deref(),
+        Some(r#"{"path":"a.rs"}"#)
+    );
+    assert_eq!(
+        accum.messages[1].tool_input.as_deref(),
+        Some(r#"{"pattern":"fn"}"#)
+    );
+}
+
+#[test]
+fn user_media_parts_render_and_unknown_parts_are_skipped_with_a_warning() {
+    let mut accum = ScanAccum::new();
+    dispatch_line(
+        &mut accum,
+        &json!({
+            "type": "context.append_message",
+            "message": {
+                "role": "user",
+                "origin": {"kind": "user"},
+                "content": [
+                    {"type": "text", "text": "listen and watch"},
+                    {"type": "audio_url", "audioUrl": {"url": "/tmp/clip.wav"}},
+                    {"type": "video_url", "videoUrl": {"url": "/tmp/clip.mp4"}},
+                    {"type": "hologram", "data": {}}
+                ],
+                "toolCalls": []
+            },
+            "time": 1000
+        }),
+    );
+
+    assert_eq!(
+        contents(&accum),
+        ["listen and watch\n[Audio: source: /tmp/clip.wav]\n[Video: source: /tmp/clip.mp4]"]
+    );
+    assert_eq!(accum.parse_warning_count, 1);
+}
+
+#[test]
+fn assistant_media_parts_render() {
+    let mut accum = ScanAccum::new();
+    dispatch_line(
+        &mut accum,
+        &json!({
+            "type": "context.append_loop_event",
+            "event": {"type": "content.part", "part": {"type": "image_url", "imageUrl": {"url": "/tmp/chart.png"}}},
+            "time": 1000
+        }),
+    );
+
+    assert_eq!(contents(&accum), ["[Image: source: /tmp/chart.png]"]);
+    assert_eq!(accum.parse_warning_count, 0);
 }

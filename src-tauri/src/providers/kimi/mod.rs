@@ -42,6 +42,9 @@ impl crate::provider::ProviderDescriptor for Descriptor {
     fn cli_command(&self) -> &'static str {
         "kimi"
     }
+    fn parser_revision(&self) -> Option<&'static str> {
+        Some("1")
+    }
 }
 
 pub struct KimiProvider {

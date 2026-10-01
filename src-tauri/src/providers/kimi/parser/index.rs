@@ -142,10 +142,6 @@ pub fn session_id_for_path(path: &Path) -> Option<String> {
 pub(super) struct StateJson {
     /// Display title kimi-code stores after the first prompt.
     pub(super) title: Option<String>,
-    /// ISO-8601 (UTC) creation time, e.g. `"2026-05-25T09:26:36.474Z"`.
-    pub(super) created_at: Option<String>,
-    /// ISO-8601 (UTC) last-update time.
-    pub(super) updated_at: Option<String>,
     /// Map of agent-name → parent-agent-name (None for `main`).
     /// Used to identify which wire.jsonl is the parent vs. subagent.
     pub(super) agents: HashMap<String, Option<String>>,
@@ -183,14 +179,6 @@ impl StateJson {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let created_at = value
-            .get("createdAt")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let updated_at = value
-            .get("updatedAt")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
         let mut agents = HashMap::new();
         let mut swarm_items = HashMap::new();
         if let Some(map) = value.get("agents").and_then(|v| v.as_object()) {
@@ -212,8 +200,6 @@ impl StateJson {
         }
         Self {
             title,
-            created_at,
-            updated_at,
             agents,
             swarm_items,
         }

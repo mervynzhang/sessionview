@@ -1,23 +1,43 @@
 //! Kimi-code wire.jsonl parser.
 //!
-//! Handles two on-disk wire formats — both start with
-//! `{"type":"metadata","protocol_version":"1.0",...}` and live under
-//! `~/.kimi-code/sessions/wd_*/<session-dir>/agents/<name>/wire.jsonl`:
+//! Each agent writes one journal,
+//! `~/.kimi-code/sessions/wd_*/<session-dir>/agents/<name>/wire.jsonl`, opening
+//! with `{"type":"metadata","protocol_version":"1.x",...}`; every later line is
+//! `{type, ...payload, time}` with `time` in epoch milliseconds. kimi-code's
+//! `packages/agent-core-v2/docs/wire-manifest.d.ts` catalogues the record types
+//! of protocol 1.0–1.5, and `src/wire/migration/` the changes between them.
 //!
-//! * **Migrated** (from legacy kimi-cli protocol 1.9): only `metadata` +
-//!   `context.append_message` lines. Messages carry `role` and structured
-//!   `content[]`/`toolCalls[]` arrays. No per-line `time` field.
-//! * **Native** (kimi-code 0.1.1+): events split into `metadata`,
-//!   `config.update`/`profile.bind`, `turn.prompt`, `context.append_message`,
-//!   `context.append_loop_event` (assistant `content.part` / `tool.call` /
-//!   `tool.result` / step bookkeeping), and `usage.record`. Each
-//!   event-bearing line carries `"time"` in epoch milliseconds.
+//! * **Migrated** (from legacy kimi-cli protocol 1.9) and **forked** agents
+//!   carry whole `context.append_message` messages — user, assistant
+//!   (`content[]` + `toolCalls[]`), and tool. Wire 1.1 flattened each tool
+//!   call's `function: {name, arguments}` onto the call; both shapes occur on
+//!   disk because kimi-code rewrites a wire only when it reopens the session.
+//!   Migrated lines carry no `time`.
+//! * **Native** (kimi-code 0.1.1+): `turn.prompt`, `context.append_message`
+//!   for user-side input, `context.append_loop_event` (assistant
+//!   `content.part` / `tool.call` / `tool.result` / step bookkeeping), and
+//!   `usage.record`.
 //!
 //! Native `context.append_message` records need special care: kimi-code uses
 //! `role:"user"` for every input fed back into the model, including runtime
 //! task notifications, subagent assignments, skills, hooks, and cron events.
 //! The structured `message.origin.kind` — not the transport role — determines
 //! whether SessionView renders a human bubble, a command, or a system status.
+//!
+//! The transcript keeps the complete history. Undo (`context.undo`) and
+//! cancelled turns change only the model's context, so their messages stay;
+//! undo adds a `[kimi_context]` marker and a cancelled turn shows its
+//! `turn.ended` status. The loop engine's journal (`agent.*`) mirrors the
+//! input, model, and tool messages of the `context.*` records, except the
+//! partial output of an interrupted model step (`source: "salvaged"`),
+//! which only the journal holds. A session fork (`kimi fork`) copies its
+//! source's records before a closing `forked`: the copy renders, its usage
+//! counts on the source only.
+//!
+//! `usage.record` is one model call: `turn` scope belongs to the current
+//! model step, `session` scope (compaction, titles, …) counts toward the
+//! session without annotating a message. Media references (`blobref:`,
+//! `kimi-file://`) resolve to local files (see `media`).
 //!
 //! The parser walks the file once, dispatching per-line by `type`, and
 //! reuses a single accumulator so the message order matches on-disk
@@ -29,6 +49,7 @@
 
 mod dispatch;
 mod index;
+mod media;
 mod subagents;
 
 use std::fs::{self, File};
@@ -61,10 +82,21 @@ fn time_ms_to_parts(ms: i64) -> Option<(i64, String)> {
 }
 
 fn scan_lines<R: BufRead>(reader: R, path: &Path, accum: &mut ScanAccum) {
-    let stats = crate::provider::util::for_each_jsonl_record(reader, path, |_, entry: Value| {
-        dispatch_line(accum, &entry);
-        std::ops::ControlFlow::Continue(())
-    });
+    let agent_dir = path.parent();
+    let stats =
+        crate::provider::util::for_each_jsonl_record(reader, path, |_, mut entry: Value| {
+            if let Some(agent_dir) = agent_dir
+                && entry
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(media::may_carry_media_refs)
+            {
+                let unresolved = media::resolve_media_refs(&mut entry, agent_dir);
+                accum.note_warnings(unresolved);
+            }
+            dispatch_line(accum, &entry);
+            std::ops::ControlFlow::Continue(())
+        });
     accum.note_warnings(
         stats
             .read_error_count
@@ -184,23 +216,14 @@ pub(crate) fn parse_session(path: &Path, index: &SessionIndex) -> Option<ParsedS
         .unwrap_or_else(|| NO_PROJECT.to_string());
     let project_name = project_name_from_path(&project_path);
 
-    let state_created = state
-        .created_at
-        .as_deref()
-        .and_then(crate::provider::util::parse_rfc3339_epoch_seconds);
-    let state_updated = state
-        .updated_at
-        .as_deref()
-        .and_then(crate::provider::util::parse_rfc3339_epoch_seconds);
-
-    let Some(created_at) = accum.first_time_secs.or(state_created) else {
+    let Some(created_at) = accum.first_time_secs else {
         log::warn!(
             "skipping Kimi session '{}': no usable timestamp found",
             path.display()
         );
         return None;
     };
-    let updated_at = accum.last_time_secs.or(state_updated).unwrap_or(created_at);
+    let updated_at = accum.last_time_secs.unwrap_or(created_at);
 
     let content_text = accum.content_parts.join("\n");
 
@@ -306,15 +329,6 @@ pub fn parse_session_tail(path: &Path, target_messages: usize) -> Option<KimiTai
             }
         }
         scan_lines(reader, path, &mut accum);
-        if accum.cancel_without_snapshot {
-            // The window opened mid-turn and that turn was cancelled; a wider
-            // window captures the turn.prompt and rolls it back cleanly.
-            if window.covers_whole_file {
-                return None;
-            }
-            scan_lines_count = scan_lines_count.saturating_mul(2);
-            continue;
-        }
         if accum.messages.len() >= target_messages || window.covers_whole_file {
             if accum.messages.is_empty() {
                 return None;
@@ -402,6 +416,86 @@ mod tests {
     }
 
     #[test]
+    fn media_references_render_from_local_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("wd_demo").join("session_media");
+        let blobs = session_dir.join("agents").join("main").join("blobs");
+        let media = session_dir.join("media");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(media.join("meta")).unwrap();
+        std::fs::write(blobs.join("c0ffee"), [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(media.join("f_1.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(
+            media.join("meta").join("f_1.json"),
+            r#"{"version":1,"key":"f_1.png","name":"pasted-image.png","mediaType":"image/png"}"#,
+        )
+        .unwrap();
+        let path = write_wire(
+            &session_dir,
+            "main",
+            &[
+                r#"{"type":"metadata","protocol_version":"1.5","created_at":1779701196480}"#,
+                r#"{"type":"context.append_message","message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"what is this?"},{"type":"image_url","imageUrl":{"url":"kimi-file://f_1"}}],"toolCalls":[]},"time":1779701196500}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"tc_1","name":"ReadMediaFile","args":{"path":"chart.png"}},"time":1779701196600}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"tc_1","result":{"output":[{"type":"image_url","imageUrl":{"url":"blobref:image/png;c0ffee"}}]}},"time":1779701196700}"#,
+            ],
+        );
+
+        let parsed = parse_session(&path, &SessionIndex::default()).unwrap();
+        // A pasted image resolves through `media/meta` to the session copy.
+        assert_eq!(
+            parsed.messages[0].content,
+            format!(
+                "what is this?\n[Image: source: {}]",
+                media.join("f_1.png").display()
+            )
+        );
+        assert_eq!(
+            parsed.messages[1].content,
+            format!("[Image: source: {}]", blobs.join("c0ffee").display())
+        );
+        assert_eq!(parsed.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn btw_fork_is_titled_by_its_own_question() {
+        // `/btw` forks an agent that copies the parent's history before its
+        // first `turn.prompt`; the side question follows it.
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("wd_demo").join("session_btw");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        write_state(
+            &session_dir,
+            r#"{"agents":{"main":{"type":"main"},"agent-0":{"type":"sub","parentAgentId":"main","forkedFrom":"main"}}}"#,
+        );
+        write_wire(
+            &session_dir,
+            "main",
+            &[
+                r#"{"type":"metadata","protocol_version":"1.5","created_at":1779701196480}"#,
+                r#"{"type":"turn.prompt","agentId":"main","input":[],"origin":{"kind":"user"},"turnId":0,"time":1779701196500}"#,
+                r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"parent prompt"}],"toolCalls":[]},"time":1779701196501}"#,
+            ],
+        );
+        let path = write_wire(
+            &session_dir,
+            "agent-0",
+            &[
+                r#"{"type":"metadata","protocol_version":"1.5","created_at":1779701197000}"#,
+                r#"{"type":"context.append_message","agentId":"agent-0","message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"parent prompt"}],"toolCalls":[]},"time":1779701197001}"#,
+                r#"{"type":"context.append_message","agentId":"agent-0","message":{"role":"user","origin":{"kind":"injection","variant":"btw"},"content":[{"type":"text","text":"<system-reminder>side channel</system-reminder>"}],"toolCalls":[]},"time":1779701197002}"#,
+                r#"{"type":"turn.prompt","agentId":"agent-0","input":[],"origin":{"kind":"user"},"turnId":0,"time":1779701197003}"#,
+                r#"{"type":"context.append_message","agentId":"agent-0","message":{"role":"user","origin":{"kind":"user"},"content":[{"type":"text","text":"What extension does notes.txt have?"}],"toolCalls":[]},"time":1779701197004}"#,
+            ],
+        );
+
+        let parsed = parse_session(&path, &SessionIndex::default()).unwrap();
+        assert_eq!(parsed.meta.title, "What extension does notes.txt have?");
+        // The copied history still renders.
+        assert_eq!(parsed.messages[0].content, "parent prompt");
+    }
+
+    #[test]
     fn parses_usage_only_agent_session() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = tmp.path().join("wd_demo").join("session_usage");
@@ -486,12 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_tail_cancel_without_prompt_returns_none() {
+    fn cancelled_turn_keeps_its_partial_output() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = tmp.path().join("wd_demo").join("session_cancel");
         std::fs::create_dir_all(&session_dir).unwrap();
         let mut lines = vec![
-            r#"{"type":"metadata","protocol_version":"1.4","created_at":1779701196480}"#
+            r#"{"type":"metadata","protocol_version":"1.5","created_at":1779701196480}"#
                 .to_string(),
             r#"{"type":"turn.prompt","time":1779701196500}"#.to_string(),
         ];
@@ -510,73 +604,26 @@ mod tests {
                 .to_string(),
             );
         }
-        lines.push(
-            r#"{"type":"usage.record","model":"kimi-test","usage":{"inputOther":10,"output":5},"usageScope":"turn","time":1779701196800}"#
-                .to_string(),
+        lines.extend(
+            [
+                r#"{"type":"usage.record","model":"kimi-test","usage":{"inputOther":10,"output":5},"usageScope":"turn","time":1779701196800}"#,
+                r#"{"type":"turn.cancel","turnId":0,"target":"active","reason":"user_cancelled","time":1779701196900}"#,
+                r#"{"type":"turn.ended","turnId":0,"reason":"cancelled","time":1779701196901}"#,
+            ]
+            .map(str::to_string),
         );
-        lines.push(r#"{"type":"turn.cancel","time":1779701196900}"#.to_string());
         let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
         let path = write_wire(&session_dir, "main", &refs);
 
-        assert!(parse_session_tail(&path, 1).is_none());
-        let parsed = parse_session(&path, &SessionIndex::default()).expect("usage is retained");
-        assert!(parsed.messages.is_empty());
+        let parsed = parse_session(&path, &SessionIndex::default()).unwrap();
+        assert_eq!(parsed.messages.len(), 81);
+        assert_eq!(parsed.messages[80].content, "[turn_cancelled]");
         assert_eq!(parsed.meta.input_tokens, 10);
-    }
+        assert_eq!(parsed.parse_warning_count, 0);
 
-    #[test]
-    fn parse_session_tail_widens_past_cancelled_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_dir = tmp.path().join("wd_demo").join("session_widen");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let mut lines = vec![
-            r#"{"type":"metadata","protocol_version":"1.4","created_at":1779701196480}"#
-                .to_string(),
-            r#"{"type":"turn.prompt","time":1779701196500}"#.to_string(),
-        ];
-        // A cancelled turn dense enough that the initial tail window starts
-        // inside it (after its turn.prompt, before its turn.cancel).
-        for index in 0..100 {
-            lines.push(
-                serde_json::json!({
-                    "type": "context.append_loop_event",
-                    "event": {
-                        "type": "tool.call",
-                        "toolCallId": format!("tc_{index}"),
-                        "name": "Read",
-                        "args": {"path": "file.rs"}
-                    },
-                    "time": 1779701196600i64 + index
-                })
-                .to_string(),
-            );
-        }
-        lines.push(r#"{"type":"turn.cancel","time":1779701196800}"#.to_string());
-        lines.push(r#"{"type":"turn.prompt","time":1779701196900}"#.to_string());
-        for index in 0..10 {
-            lines.push(
-                serde_json::json!({
-                    "type": "context.append_loop_event",
-                    "event": {
-                        "type": "content.part",
-                        "part": {"type": "text", "text": format!("answer {index}")}
-                    },
-                    "time": 1779701197000i64 + index
-                })
-                .to_string(),
-            );
-        }
-        let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
-        let path = write_wire(&session_dir, "main", &refs);
-
-        let tail = parse_session_tail(&path, 5).expect("widened window rolls the cancel back");
+        let tail = parse_session_tail(&path, 5).unwrap();
         assert_eq!(tail.messages.len(), 5);
         assert_eq!(tail.parse_warning_count, 0);
-        assert!(
-            tail.messages
-                .iter()
-                .all(|message| message.role == MessageRole::Assistant)
-        );
     }
 
     #[test]
