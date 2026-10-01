@@ -204,6 +204,23 @@ describe("MessageBubble", () => {
     expect(container.querySelector(".msg-system-body")?.textContent).toBe(detail);
   });
 
+  it.each([
+    ["[turn_cancelled]", "Cancelled"],
+    ["[turn_failed]\nprovider returned 500", "Turn failed"],
+    ["[turn_blocked]\nwaiting for approval", "Blocked"],
+    ["[step_interrupted] aborted", "Step interrupted"],
+    ["[retry] attempt 2/5 after 1000 ms (APIError)", "Retry"],
+    ["[deliverables]\n/tmp/guide.md — Workspace guide", "Deliverables"],
+    ["[mode] plan", "Permission mode"],
+    ["[informational] Context left until auto-compact: 8%", "Info"],
+    ['[goal]\n{"objective":"ship it","status":"active"}', "Goal"],
+  ])("renders %j as a labelled system row", (content, label) => {
+    const { container } = render(<MessageBubble message={message({ role: "system", content })} />);
+
+    expect(container.querySelector(".sys-label")?.textContent).toBe(label);
+    expect(container.textContent).not.toContain(content.split(/[\s\n]/, 1)[0]);
+  });
+
   it("hides context compacted content until expanded", () => {
     const detail = "very long compacted context\nwith more retained conversation details";
     const { container } = render(

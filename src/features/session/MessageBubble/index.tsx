@@ -148,6 +148,62 @@ const SYSTEM_SUBTYPE_CONFIG: Record<
     labelKey: "system.turnAborted",
     cls: "sys-error",
   },
+  // Kimi turn and step lifecycle (`[turn_<reason>]`, `[step_interrupted]`,
+  // `[retry]`): the detail is the reason or error text.
+  turn_cancelled: {
+    icon: "\u23F9",
+    labelKey: "system.turnCancelled",
+    cls: "sys-error",
+  },
+  turn_failed: {
+    icon: "\u26A0",
+    labelKey: "system.turnFailed",
+    cls: "sys-error",
+    collapsible: true,
+  },
+  turn_blocked: {
+    icon: "\u26D4",
+    labelKey: "system.turnBlocked",
+    cls: "sys-error",
+    collapsible: true,
+  },
+  step_interrupted: {
+    icon: "\u23F9",
+    labelKey: "system.stepInterrupted",
+    cls: "sys-error",
+  },
+  retry: {
+    icon: "\uD83D\uDD01",
+    labelKey: "system.retry",
+    cls: "sys-info",
+  },
+  // DSH files the harness presented to the user, one per line.
+  deliverables: {
+    icon: "\uD83D\uDCE6",
+    labelKey: "system.deliverables",
+    cls: "sys-info",
+    collapsible: true,
+  },
+  // Claude Code permission-mode changes (`[mode] plan`).
+  mode: {
+    icon: "\uD83D\uDEE1",
+    labelKey: "system.permissionMode",
+    cls: "sys-info",
+  },
+  informational: {
+    icon: "\u2139",
+    labelKey: "system.informational",
+    cls: "sys-info",
+    collapsible: true,
+  },
+  // Codex thread goal: the detail is the goal's JSON snapshot.
+  goal: {
+    icon: "\uD83C\uDFAF",
+    labelKey: "system.goal",
+    cls: "sys-info",
+    collapsible: true,
+    hideCollapsedDetail: true,
+  },
   context_compacted: {
     icon: "\u2702",
     labelKey: "system.contextCompacted",
