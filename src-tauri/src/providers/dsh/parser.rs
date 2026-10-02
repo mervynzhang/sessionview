@@ -3246,10 +3246,14 @@ mod tests {
         let home = TempDir::new().unwrap();
         let stored = "ab".repeat(32);
         let missing = "cd".repeat(32);
-        let objects = home.path().join("attachments/v1/objects");
+        let objects = home.path().join("attachments").join("v1").join("objects");
         std::fs::create_dir_all(objects.join("ab")).unwrap();
         std::fs::write(objects.join("ab").join(&stored), b"\x89PNG\r\n\x1a\n").unwrap();
-        let session_dir = home.path().join("sessions/--tmp-p--").join(SESSION_ID);
+        let session_dir = home
+            .path()
+            .join("sessions")
+            .join("--tmp-p--")
+            .join(SESSION_ID);
         std::fs::create_dir_all(&session_dir).unwrap();
         let image = |id: &str| {
             format!(
