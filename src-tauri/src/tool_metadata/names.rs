@@ -84,4 +84,21 @@ mod tests {
             "Agent"
         );
     }
+
+    #[test]
+    fn dsh_delegating_tools_are_agents_with_their_own_names() {
+        for raw in ["subagent", "subagent_fork", "workflow"] {
+            assert_eq!(canonical_tool_name(Provider::Dsh, raw), "Agent", "{raw}");
+        }
+        assert_eq!(
+            super::display_tool_name("subagent_fork", "Agent"),
+            "subagent fork"
+        );
+        assert_eq!(super::display_tool_name("workflow", "Agent"), "workflow");
+        // Other providers' lowercase `workflow` keeps its literal name.
+        assert_eq!(
+            canonical_tool_name(Provider::Claude, "workflow"),
+            "workflow"
+        );
+    }
 }

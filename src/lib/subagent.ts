@@ -14,6 +14,7 @@ export const SUBAGENT_FILE_PROVIDERS = new Set([
   "mcode",
   "copilot",
   "commandcode",
+  "dsh",
 ]);
 
 /**

@@ -376,6 +376,10 @@ pub(super) fn descriptor_for(provider: Provider, raw_name: &str) -> Option<ToolD
     {
         return descriptor_for_canonical("Agent");
     }
+    // DSH forks and workflows spawn delegated child sessions like `subagent`.
+    if provider == Provider::Dsh && matches!(raw_name, "subagent_fork" | "workflow") {
+        return descriptor_for_canonical("Agent");
+    }
 
     DESCRIPTORS
         .iter()
@@ -461,7 +465,8 @@ fn raw_display_name(raw_name: &str) -> Option<&'static str> {
         "TaskList" => "task list",
         "TaskOutput" => "task output",
         "TaskStop" => "task stop",
-        "Workflow" => "workflow",
+        "Workflow" | "workflow" => "workflow",
+        "subagent_fork" => "subagent fork",
         "StructuredOutput" => "structured output",
         "ToolSearch" => "tool search",
         "CronCreate" => "cron create",

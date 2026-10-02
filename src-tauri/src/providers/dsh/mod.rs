@@ -61,7 +61,7 @@ impl crate::provider::ProviderDescriptor for Descriptor {
         "dsh"
     }
     fn parser_revision(&self) -> Option<&'static str> {
-        Some("1")
+        Some("3")
     }
 }
 

@@ -25,38 +25,71 @@
 //! - v4 lifts `tool/result` out of its `tool-result` wrapper block: the message
 //!   has `role: "tool"`, the result blocks as its own `content`, and
 //!   `toolCallId` / `isError` beside them.
-//! - v2+ sessions never emit `assistant/chunk` rows: failed model calls are recorded
-//!   as `assistant/attempt` events (usage + `finish` error chunks only, no text
-//!   deltas — nothing to reconstruct), and parallel-tool detail rides
-//!   `tool/ptc-dispatch[-start]` rows that duplicate their parent `tool/call` +
-//!   `tool/result` pair. All three are log-only, as are `workspace/changes`,
-//!   `model/selection`, `session-log-deepseek/delivery-accepted`, the renamed
-//!   `approval/asked` + `approval/decided` pair, and `activity/status`.
+//! - v2+ sessions never emit `assistant/chunk` rows: a model call that committed
+//!   no surface message is recorded as `assistant/attempt`, whose embedded
+//!   stream carries no surfaced text; its streamed usage chunk still counts
+//!   (the call was billed).
+//! - PTC (`run_code`) executes inner tool calls; each one is logged as a
+//!   `tool/ptc-dispatch-start` + `tool/ptc-dispatch` pair (`tool/code-dispatch*`
+//!   in v2) keyed by `subCallId`, and surfaces as its own Tool message after the
+//!   `run_code` call that ran it.
 //! - `system/message` carries the session's system prompt and v4 `developer/message`
 //!   the tool-availability changes. Both are dropped like the other
 //!   system-injected context dumps: harness context, not conversation.
 //! - `deliverables/presented` lists files the harness presented to the user;
 //!   it surfaces as a tagged System line following the subagent-report convention.
+//! - A `turn/end` whose reason is not `completed` surfaces as a tagged status
+//!   line (`[turn_failed]`, `[turn_cancelled]`, `[turn_interrupted]`,
+//!   `[turn_blocked]`, `[turn_max_tokens]`, or `[turn_ended] <kind>` for a
+//!   plugin-defined reason); a fork seed's `forked` closer is boundary
+//!   bookkeeping and stays silent. Each `llm/retry` surfaces as a `[retry]`
+//!   line (`llm/retry-started` only marks the wait ending).
+//! - A user slash command is a `command/run` + `command/done` pair keyed by
+//!   `commandId`: the run renders as command input (`/<name><args>`), the
+//!   outcome text as command output.
+//! - Delegation links: `subagent/catalog` (every delegated child, appended
+//!   while the delegating tool runs) and `tool-workflow/agent-start` (a
+//!   workflow agent's label) name the child session id. DSH runs one tool at a
+//!   time, so the child belongs to the single open Agent-category tool call;
+//!   its id and label land in that Tool message's
+//!   `structured.childConversationIds` / `childPrompts`. Any other open-call
+//!   count leaves the child unlinked (logged) — a format migration appends
+//!   missing catalog facts after the final turn, where no call is open.
+//! - Image blocks reference content-addressed attachments
+//!   (`attachment.attachmentId: "sha256:<hex>"`) stored at
+//!   `$DSH_HOME/attachments/v1/objects/<hex[..2]>/<hex>`; an existing object
+//!   renders as `[Image: source: <path>]`, anything else as `[Image]`. A
+//!   user-attached file block renders as `[File: <name>]`.
+//! - Token usage also comes from `compaction/summary.data.usage` (the
+//!   summarization call, attributed to its own `model`).
+//! - Title precedence: a delegated session's descriptor label, then the latest
+//!   non-fallback `session/title` (LLM or user-assigned), then the first user
+//!   message, then DSH's `fallback` title (a few leading prompt words).
+//! - Everything else in DSH's known event vocabulary (approval, feedback,
+//!   hooks, teams, schedules, workflow lifecycle, image offload, delivery
+//!   watermarks, …) is log-only.
 //! - Every following record is a session event `{type, seq, time, data}` or a
 //!   packed chunk row (`text-chunks` / `reasoning-chunks` / `tool-call-chunks`)
 //!   that replays raw stream deltas in one storage line.
-//! - Only three event types carry conversation surface semantics:
-//!   `user/message`, `assistant/message`, `tool/result`. Everything else
-//!   (`turn/*`, `step/*`, `request/*`, `assistant/chunk`, plugin rows such as
-//!   `session/title`, `permission/preset`, …) is log-only and never contributes
-//!   to the transcript.
+//! - The conversation surface comes from `user/message`, `assistant/message`,
+//!   `tool/call` + `tool/result`, the PTC dispatch pairs, and the command
+//!   pairs; the status lines, delegation links, titles and usage listed above
+//!   are read from their own events. Every other event is log-only and never contributes to the
+//!   transcript.
 //!
 //! Surface mapping:
 //! - `user/message` whose `source.kind` is `"user"` becomes a User message.
 //!   Workspace-instruction dumps (`source.kind == "agent-instructions"`) and
 //!   any producer's context dump (`form` of `snapshot`, `instructions`,
 //!   `catalog` or `recall`) are system-injected context, not conversation —
-//!   the DSH GUI collapses them, so we drop them. Every other surfaced
+//!   the DSH GUI collapses them, so we drop them. A `session-reference`
+//!   recall keeps only the referenced sessions' labels, as a
+//!   `[session_reference]` line. Every other surfaced
 //!   user-role message (approval-policy changes, goal rounds, relayed agent
 //!   messages, cron notices, …) renders as a System line.
 //! - `assistant/message` blocks: `text` → Assistant message (flushed around
 //!   tool calls), `reasoning` → System `[thinking]` line (Claude convention),
-//!   `tool-call` → Tool message with metadata, `image` → `[Image]` marker.
+//!   `tool-call` → Tool message with metadata, `image` → image marker.
 //! - `tool/result` content is attached to the Tool message whose `callId` the
 //!   `assistant/message` (or `tool/call`) surfaced; an orphan result creates a
 //!   standalone Tool message.
@@ -69,8 +102,10 @@
 //!   still gets a placeholder so accounting is never silently dropped.
 //!
 //! Robustness:
-//! - A torn final record (no trailing newline) is a crash artifact; DSH's own
-//!   scanner ignores it, so do we (no parse warning).
+//! - A torn final record (no trailing newline) or a torn final zstd frame is a
+//!   crash artifact; DSH's own scanner keeps the complete records before it, so
+//!   do we (no parse warning). A read failure anywhere else keeps the records
+//!   read so far and counts a parse warning.
 //! - Malformed lines and unknown *required* event types (no `ignorable: true`)
 //!   are logged and counted into `parse_warning_count` so the UI shows the ⚠
 //!   badge instead of rendering a silently wrong transcript. Unknown ignorable
@@ -84,17 +119,18 @@
 //!   `tool/result` (an output trimmed for the model) never overwrites the
 //!   result it shadows.
 //!
-//! Token usage rides `ParsedSession::usage_events` (one row per
-//! `assistant/message` event that reports usage); per-message `token_usage` is
-//! still attached for display.
-//! An event without its own `source.model` falls back to the session-level
-//! model; a row that still lacks a model (or a timestamp) is skipped as a
-//! counted parse warning, never silently.
+//! Token usage rides `ParsedSession::usage_events` (one row per billed model
+//! call: `assistant/message`, `assistant/attempt`, `compaction/summary`);
+//! per-message `token_usage` is attached for display.
+//! An event without its own model falls back to the latest routed request
+//! model (`request/context`, `request/header`), then the session-level model;
+//! a row that still lacks a model (or a timestamp) is skipped as a counted
+//! parse warning, never silently.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -170,7 +206,10 @@ struct ParseState {
     /// Call ids whose result is already shown; a replacement result for one
     /// of them (an output trimmed for the model) leaves it intact.
     tool_results: HashSet<String>,
+    /// Latest LLM-generated or user-assigned `session/title`.
     latest_title: Option<String>,
+    /// DSH's deterministic `fallback` title (a few leading prompt words).
+    fallback_title: Option<String>,
     first_user_text: Option<String>,
     /// `subagent/descriptor.label`: the delegation name the parent chose.
     /// A delegated session is never LLM-titled, so this is its display name.
@@ -190,6 +229,16 @@ struct ParseState {
     usage_events: Vec<UsageEvent>,
     /// First seq after a v0/v1 header's inherited prefix, until reached.
     seed_cut: Option<u64>,
+    /// `$DSH_HOME/attachments/v1/objects`, derived from the log's location.
+    attachment_objects: Option<PathBuf>,
+    /// Model of the latest routed request (`request/context`,
+    /// `request/header`): what a usage row without its own model billed.
+    request_model: Option<String>,
+    /// Tool calls started (`tool/call`, PTC dispatch start), not yet settled.
+    open_tool_calls: Vec<String>,
+    /// Linked child session id → (Tool message index, position in that
+    /// message's `childConversationIds`).
+    child_links: HashMap<String, (usize, usize)>,
 }
 
 impl ParseState {
@@ -211,6 +260,42 @@ impl ParseState {
             model,
             ..Message::assistant(text)
         });
+    }
+
+    fn note_warning(&mut self) {
+        self.parse_warning_count = self.parse_warning_count.saturating_add(1);
+    }
+
+    /// Record one billed model call. `model` falls back to the latest routed
+    /// request model, then the session model; a row that still has no model
+    /// (or no timestamp to bucket by) is skipped as a counted warning.
+    fn push_usage_event(
+        &mut self,
+        usage: &TokenUsage,
+        model: Option<String>,
+        timestamp: Option<&str>,
+    ) {
+        let model = model
+            .or_else(|| self.request_model.clone())
+            .or_else(|| self.model.clone());
+        match (timestamp, model) {
+            (Some(timestamp), Some(model)) => self.usage_events.push(UsageEvent {
+                timestamp: timestamp.to_string(),
+                model,
+                turn_count: 1,
+                input_tokens: u64::from(usage.input_tokens),
+                output_tokens: u64::from(usage.output_tokens),
+                cache_read_input_tokens: u64::from(usage.cache_read_input_tokens),
+                cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
+                usage_hash: None,
+                cost_is_estimate: false,
+                cost_usd: None,
+            }),
+            _ => {
+                log::warn!("skipping DSH usage without a timestamp or model");
+                self.note_warning();
+            }
+        }
     }
 
     /// Everything parsed so far is the parent history a seeded session
@@ -256,9 +341,18 @@ fn scan_records(
         buffer.clear();
         let n = match reader.read_until(b'\n', &mut buffer) {
             Ok(n) => n,
+            // The final zstd frame was cut mid-write: a crash artifact. The
+            // complete records before it stand, as in DSH's own reader.
+            Err(error) if header.is_some() && error.kind() == ErrorKind::UnexpectedEof => {
+                log::debug!("DSH session '{}' ends in a torn frame", path.display());
+                break;
+            }
             Err(error) => {
                 log::warn!("failed to read DSH session '{}': {error}", path.display());
-                return None;
+                header.as_ref()?;
+                // Keep what was read, flagged: the rest is unreadable.
+                state.note_warning();
+                break;
             }
         };
         if n == 0 {
@@ -276,7 +370,7 @@ fn scan_records(
                     "skipping non-UTF-8 DSH record at line {line_no} in '{}': {error}",
                     path.display()
                 );
-                state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+                state.note_warning();
                 continue;
             }
         };
@@ -295,7 +389,7 @@ fn scan_records(
                             path.display(),
                             parsed.version
                         );
-                        state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+                        state.note_warning();
                     }
                     state.seed_cut = parsed.seed_length.filter(|length| *length > 0);
                     header = Some(parsed);
@@ -325,7 +419,7 @@ fn scan_records(
                     "skipping malformed DSH record at line {line_no} in '{}': {error}",
                     path.display()
                 );
-                state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+                state.note_warning();
                 continue;
             }
         };
@@ -337,7 +431,7 @@ fn scan_records(
 fn handle_record(record: &Value, state: &mut ParseState) {
     let Some(event_type) = record.get("type").and_then(Value::as_str) else {
         log::warn!("skipping DSH record without a type tag");
-        state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+        state.note_warning();
         return;
     };
     if let Some(time) = record.get("time").and_then(Value::as_i64) {
@@ -360,8 +454,66 @@ fn handle_record(record: &Value, state: &mut ParseState) {
             if let Some(title) = data.get("title").and_then(Value::as_str)
                 && !title.trim().is_empty()
             {
-                state.latest_title = Some(title.to_string());
+                if data.pointer("/source/kind").and_then(Value::as_str) == Some("fallback") {
+                    state.fallback_title = Some(title.to_string());
+                } else {
+                    state.latest_title = Some(title.to_string());
+                }
             }
+        }
+        "turn/end" => handle_turn_end(data, state, timestamp),
+        "command/run" => handle_command_run(data, state, timestamp),
+        "command/done" => handle_command_done(data, state, timestamp),
+        "llm/retry" => handle_llm_retry(data, state, timestamp),
+        // The routed model of the request that follows; a usage row without
+        // its own model was billed against it.
+        "request/context" => {
+            if let Some(model) = data.get("model").and_then(Value::as_str) {
+                state.request_model = Some(model.to_string());
+            }
+        }
+        "request/header" => {
+            if let Some(model) = data.pointer("/header/config/model").and_then(Value::as_str) {
+                state.request_model = Some(model.to_string());
+            }
+        }
+        // The summarization call that produced a compaction checkpoint.
+        "compaction/summary" => {
+            if let Some(usage) = data
+                .get("usage")
+                .and_then(|usage| token_usage_from(usage, &DSH_USAGE_KEYS))
+            {
+                let model = data
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                state.push_usage_event(&usage, model, timestamp.as_deref());
+            }
+        }
+        // A model call that committed no surface message; its streamed usage
+        // (when the provider reported any) was still billed.
+        "assistant/attempt" => {
+            if let Some(usage) = last_stream_usage(data).filter(|usage| usage.total_tokens() > 0) {
+                state.push_usage_event(&usage, None, timestamp.as_deref());
+            }
+        }
+        "subagent/catalog" => {
+            if let Some(child_id) = data.get("childId").and_then(Value::as_str) {
+                let label = data.get("label").and_then(Value::as_str);
+                link_child_session(state, child_id, label);
+            }
+        }
+        "tool-workflow/agent-start" => {
+            if let Some(child_id) = data.get("childId").and_then(Value::as_str) {
+                let label = data.get("label").and_then(Value::as_str);
+                link_child_session(state, child_id, label);
+            }
+        }
+        "tool/ptc-dispatch-start" | "tool/code-dispatch-start" => {
+            handle_ptc_dispatch_start(data, state, timestamp);
+        }
+        "tool/ptc-dispatch" | "tool/code-dispatch" => {
+            handle_ptc_dispatch(data, state, timestamp);
         }
         "user/message" => handle_user_message(data, state, timestamp),
         "assistant/message" => handle_assistant_message(data, state, timestamp),
@@ -440,7 +592,7 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 state.agent_preset = Some(agent_preset.to_string());
             } else {
                 log::warn!("skipping malformed DSH agent-preset/selected event");
-                state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+                state.note_warning();
             }
         }
         "step/end" => {
@@ -451,39 +603,41 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 flush_step_chunks(state, turn as u32, step as u32);
             }
         }
-        // Known log-only event families: boundaries, request metadata, chunk
-        // rows, compaction brackets and shadow prices, and informational
-        // plugin rows. None carries surface semantics. The v2+ generation adds
-        // failed-attempt markers (`assistant/attempt`: usage + `finish`-error
-        // chunks only), parallel-tool detail duplicating the parent
-        // `tool/call` pair (`tool/ptc-dispatch[-start]`), and transport/model
-        // bookkeeping.
+        // Known log-only event families: boundaries, chunk rows, compaction
+        // brackets and shadow prices, approvals, feedback, hooks, teams,
+        // schedules, workflow lifecycle, model-facing image offload, and
+        // transport/model bookkeeping. None carries surface semantics.
         "turn/start"
-        | "turn/end"
         | "step/start"
-        | "request/header"
-        | "request/context"
         | "todo/write"
-        | "command/run"
-        | "command/done"
         | "permission/preset"
         | "sandbox/mode"
         | "approval/policy"
         | "agent/inbox/spliced"
         | "session/title-llm-request"
-        | "llm/retry"
         | "llm/retry-started"
         | "compaction/start"
         | "compaction/end"
-        | "compaction/summary"
         | "compaction/prune"
+        | "image/offload"
         | "approval/requested"
         | "approval/resolved"
         | "approval/asked"
         | "approval/decided"
-        | "assistant/attempt"
-        | "tool/ptc-dispatch"
-        | "tool/ptc-dispatch-start"
+        | "feedback/record"
+        | "feedback/message-put"
+        | "feedback/message-delete"
+        | "hook/invoked"
+        | "hook/result"
+        | "team/member"
+        | "team/task"
+        | "team/message/queued"
+        | "team/message/delivered"
+        | "schedule/change"
+        | "subagent/model-selection-policy"
+        | "tool-workflow/run-start"
+        | "tool-workflow/run-end"
+        | "tool-workflow/agent-end"
         | "workspace/changes"
         | "model/selection"
         | "session-log-deepseek/delivery-accepted"
@@ -493,8 +647,6 @@ fn handle_record(record: &Value, state: &mut ParseState) {
         | "question/requested"
         | "question/resolved"
         | "stream/error"
-        | "tool/code-dispatch"
-        | "tool/code-dispatch-start"
         | "session/created"
         | "session/event"
         | "web/deepseek-search-llm-request" => {}
@@ -510,22 +662,55 @@ fn handle_record(record: &Value, state: &mut ParseState) {
                 // of the surrounding log; surface it as a parse warning rather
                 // than rendering a silently wrong transcript.
                 log::warn!("skipping unknown required DSH event '{unknown}'");
-                state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+                state.note_warning();
             }
         }
     }
 }
 
+/// The transcript marker for an image block: `[Image: source: <path>]` when
+/// its `sha256:` attachment object exists under `objects`, else `[Image]`.
+/// Only a 64-digit hex id becomes a path, so a log cannot point elsewhere.
+fn image_marker(block: &Value, objects: Option<&Path>) -> String {
+    let path = block
+        .pointer("/attachment/attachmentId")
+        .and_then(Value::as_str)
+        .and_then(|id| id.strip_prefix("sha256:"))
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .zip(objects)
+        .map(|(hex, objects)| objects.join(&hex[..2]).join(hex));
+    match path {
+        Some(path) if path.is_file() => format!("[Image: source: {}]", path.display()),
+        Some(path) => {
+            log::debug!("DSH image attachment missing: {}", path.display());
+            "[Image]".to_string()
+        }
+        None => "[Image]".to_string(),
+    }
+}
+
+/// A user-attached file: `[File: <name>]`, or `[File]` when unnamed.
+fn file_marker(block: &Value) -> String {
+    match block
+        .pointer("/attachment/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+    {
+        Some(name) => format!("[File: {name}]"),
+        None => "[File]".to_string(),
+    }
+}
+
 /// Extract plain text from a message `content` payload, following the Claude
-/// provider's convention of trailing `[Image]` markers for image blocks. The
+/// provider's convention of trailing attachment markers (images, files). The
 /// payload is normally a `ContentBlock[]` array; a bare string (older or
 /// foreign producers) is used verbatim.
-fn extract_block_text(content: &Value) -> String {
+fn extract_block_text(content: &Value, objects: Option<&Path>) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
     }
     let mut parts = Vec::new();
-    let mut image_count = 0usize;
+    let mut attachments = Vec::new();
     if let Some(blocks) = content.as_array() {
         for block in blocks {
             match block.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -534,16 +719,15 @@ fn extract_block_text(content: &Value) -> String {
                         parts.push(text.to_string());
                     }
                 }
-                "image" => image_count += 1,
+                "image" => attachments.push(image_marker(block, objects)),
+                "file" => attachments.push(file_marker(block)),
                 other => {
                     log::debug!("skipping DSH content block '{other}'");
                 }
             }
         }
     }
-    for _ in 0..image_count {
-        parts.push("[Image]".to_string());
-    }
+    parts.extend(attachments);
     parts.join("\n")
 }
 
@@ -560,7 +744,7 @@ fn handle_user_message(data: &Value, state: &mut ParseState, timestamp: Option<S
             && data.pointer("/source/plugin").and_then(Value::as_str) == Some("compact"));
     let text = data
         .get("content")
-        .map(extract_block_text)
+        .map(|content| extract_block_text(content, state.attachment_objects.as_deref()))
         .unwrap_or_default();
     if text.trim().is_empty() {
         return;
@@ -573,6 +757,36 @@ fn handle_user_message(data: &Value, state: &mut ParseState, timestamp: Option<S
         // not conversation; the DSH UI collapses them, so do we. The dump
         // shape is identified by its `form`, not the producer `kind`
         // (`plugin`, `runtime-context`, `skill-catalog`, … all qualify).
+        // A cross-session recall: the referenced sessions' captured history
+        // is context for the model, but which sessions the user referenced is
+        // part of the conversation — name them, drop the snapshot.
+        "session-reference" => {
+            let labels: Vec<&str> = data
+                .pointer("/source/references")
+                .and_then(Value::as_array)
+                .map(|references| {
+                    references
+                        .iter()
+                        .filter_map(|reference| {
+                            reference
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .filter(|label| !label.trim().is_empty())
+                                .or_else(|| reference.get("sessionId").and_then(Value::as_str))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if labels.is_empty() {
+                log::warn!("skipping DSH session reference without referenced sessions");
+                state.note_warning();
+            } else {
+                state.messages.push(Message {
+                    timestamp,
+                    ..Message::system(format!("[session_reference]\n{}", labels.join("\n")))
+                });
+            }
+        }
         "agent-instructions" => {
             log::debug!("skipping DSH agent-instructions user message");
         }
@@ -703,7 +917,7 @@ fn handle_assistant_message(data: &Value, state: &mut ParseState, timestamp: Opt
         .and_then(|usage| token_usage_from(usage, &DSH_USAGE_KEYS));
     let turn_start = state.messages.len();
     let mut text_parts: Vec<String> = Vec::new();
-    let mut image_count = 0usize;
+    let mut images: Vec<String> = Vec::new();
     if let Some(blocks) = message.get("content").and_then(Value::as_array) {
         for block in blocks {
             match block.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -741,45 +955,20 @@ fn handle_assistant_message(data: &Value, state: &mut ParseState, timestamp: Opt
                         block.get("arguments").and_then(Value::as_str).unwrap_or("");
                     push_tool_message(state, name, arguments_raw, call_id, timestamp.clone());
                 }
-                "image" => image_count += 1,
+                "image" => images.push(image_marker(block, state.attachment_objects.as_deref())),
                 other => {
                     log::warn!("skipping unknown DSH assistant content block '{other}'");
-                    state.parse_warning_count = state.parse_warning_count.saturating_add(1);
+                    state.note_warning();
                 }
             }
         }
     }
-    for _ in 0..image_count {
-        text_parts.push("[Image]".to_string());
-    }
+    text_parts.extend(images);
     if !text_parts.is_empty() {
         state.push_assistant(text_parts.join("\n"), model.clone(), timestamp.clone());
     }
     if let Some(usage) = usage {
-        // The usage also lands in `usage_events` (copied before the move
-        // below), matching how DSH's own usage collector folds the log. An event without its own model
-        // falls back to the session-level model; only when neither exists
-        // (or the record has no timestamp to bucket by) is the row skipped,
-        // and then as a counted parse warning, never silently.
-        let usage_model = model.clone().or_else(|| state.model.clone());
-        match (timestamp.as_deref(), usage_model) {
-            (Some(timestamp), Some(model)) => state.usage_events.push(UsageEvent {
-                timestamp: timestamp.to_string(),
-                model,
-                turn_count: 1,
-                input_tokens: u64::from(usage.input_tokens),
-                output_tokens: u64::from(usage.output_tokens),
-                cache_read_input_tokens: u64::from(usage.cache_read_input_tokens),
-                cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
-                usage_hash: None,
-                cost_is_estimate: false,
-                cost_usd: None,
-            }),
-            _ => {
-                log::warn!("skipping DSH usage event without a timestamp or model");
-                state.parse_warning_count = state.parse_warning_count.saturating_add(1);
-            }
-        }
+        state.push_usage_event(&usage, model.clone(), timestamp.as_deref());
         // Attach usage to the event's last non-System message so accounting
         // is never silently dropped; a thinking-only step gets a placeholder.
         if let Some(last) = state.messages[turn_start..]
@@ -818,6 +1007,7 @@ fn handle_tool_call(data: &Value, state: &mut ParseState, timestamp: Option<Stri
     let Some(call_id) = data.get("callId").and_then(Value::as_str) else {
         return;
     };
+    state.open_tool_calls.push(call_id.to_string());
     if state.tool_by_call_id.contains_key(call_id) {
         // Already surfaced through the step's assistant/message blocks.
         return;
@@ -860,8 +1050,40 @@ fn handle_tool_result(
         .unwrap_or(false);
     let result_text = result
         .get("content")
-        .map(extract_block_text)
+        .map(|content| extract_block_text(content, state.attachment_objects.as_deref()))
         .unwrap_or_default();
+    settle_tool_call(
+        state,
+        call_id,
+        result_text,
+        is_error,
+        timestamp,
+        OrphanCall::default(),
+    );
+}
+
+/// What an orphan result knows about the call it settles.
+#[derive(Default)]
+struct OrphanCall<'a> {
+    name: Option<&'a str>,
+    arguments: Option<String>,
+}
+
+/// Attach a result to the Tool message its `call_id` surfaced and close the
+/// call. A result whose call never surfaced (e.g. the model call was
+/// interrupted before its message assembled) becomes a standalone Tool
+/// message built from `orphan`.
+fn settle_tool_call(
+    state: &mut ParseState,
+    call_id: Option<&str>,
+    result_text: String,
+    is_error: bool,
+    timestamp: Option<String>,
+    orphan: OrphanCall<'_>,
+) {
+    if let Some(call_id) = call_id {
+        state.open_tool_calls.retain(|open| open != call_id);
+    }
     let result_facts = ToolResultFacts {
         is_error: Some(is_error),
         ..ToolResultFacts::default()
@@ -877,12 +1099,11 @@ fn handle_tool_result(
         }
         return;
     }
-    // Orphan result: no surfaced call to attach to (e.g. the model call was
-    // interrupted before its message assembled). Standalone Tool message.
+    let input = orphan.arguments.as_deref().and_then(parse_tool_arguments);
     let mut metadata = build_tool_metadata(ToolCallFacts {
         provider: Provider::Dsh,
-        raw_name: "tool",
-        input: None,
+        raw_name: orphan.name.unwrap_or("tool"),
+        input: input.as_ref(),
         call_id,
         assistant_id: None,
     });
@@ -891,8 +1112,269 @@ fn handle_tool_result(
     state.messages.push(Message {
         timestamp,
         tool_name: Some(canonical_name),
+        tool_input: orphan.arguments,
         tool_metadata: Some(metadata),
         ..Message::new(MessageRole::Tool, result_text)
+    });
+}
+
+/// A PTC sub-call started inside `run_code`: its own Tool message, keyed by
+/// `subCallId`. Arguments are logged as a JSON object, not a raw string.
+fn handle_ptc_dispatch_start(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
+    let Some(sub_call_id) = data.get("subCallId").and_then(Value::as_str) else {
+        log::warn!("skipping DSH PTC dispatch start without a subCallId");
+        state.note_warning();
+        return;
+    };
+    state.open_tool_calls.push(sub_call_id.to_string());
+    if state.tool_by_call_id.contains_key(sub_call_id) {
+        return;
+    }
+    let name = data.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let arguments = data
+        .get("arguments")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    push_tool_message(state, name, &arguments, Some(sub_call_id), timestamp);
+}
+
+/// A settled PTC sub-call: attach its result to the sub-call's Tool message.
+fn handle_ptc_dispatch(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
+    let Some(sub_call_id) = data.get("subCallId").and_then(Value::as_str) else {
+        log::warn!("skipping DSH PTC dispatch without a subCallId");
+        state.note_warning();
+        return;
+    };
+    let is_error = data
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result_text = data
+        .get("content")
+        .map(|content| extract_block_text(content, state.attachment_objects.as_deref()))
+        .unwrap_or_default();
+    let orphan = OrphanCall {
+        name: data.get("name").and_then(Value::as_str),
+        arguments: data.get("arguments").map(Value::to_string),
+    };
+    settle_tool_call(
+        state,
+        Some(sub_call_id),
+        result_text,
+        is_error,
+        timestamp,
+        orphan,
+    );
+}
+
+/// Link a delegated child session to the Tool message that spawned it: the
+/// single open Agent-category call (DSH runs one tool at a time). A known
+/// child only refreshes its label — `tool-workflow/agent-start` names a
+/// workflow agent its catalog entry left unlabeled.
+fn link_child_session(state: &mut ParseState, child_id: &str, label: Option<&str>) {
+    let label = label.map(str::trim).filter(|label| !label.is_empty());
+    if let Some(&(idx, position)) = state.child_links.get(child_id) {
+        if let Some(label) = label
+            && let Some(prompts) = state.messages[idx]
+                .tool_metadata
+                .as_mut()
+                .and_then(|metadata| metadata.structured.as_mut())
+                .and_then(|structured| structured.get_mut("childPrompts"))
+                .and_then(Value::as_array_mut)
+            && let Some(slot) = prompts.get_mut(position)
+        {
+            *slot = Value::String(label.to_string());
+        }
+        return;
+    }
+    let candidates: Vec<usize> = state
+        .open_tool_calls
+        .iter()
+        .filter_map(|call_id| state.tool_by_call_id.get(call_id).copied())
+        .filter(|&idx| state.messages[idx].tool_name.as_deref() == Some("Agent"))
+        .collect();
+    let idx = match candidates[..] {
+        [idx] => idx,
+        // A format migration appends missing catalog facts after the final
+        // turn, where no call is open; those children stay unlinked.
+        [] => {
+            log::debug!("DSH child session {child_id} has no open delegating tool call");
+            return;
+        }
+        _ => {
+            log::warn!(
+                "DSH child session {child_id} has {} open delegating tool calls; leaving it unlinked",
+                candidates.len()
+            );
+            return;
+        }
+    };
+    let Some(metadata) = state.messages[idx].tool_metadata.as_mut() else {
+        return;
+    };
+    let structured = metadata
+        .structured
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(object) = structured.as_object_mut() else {
+        log::warn!("DSH delegating tool metadata is not an object; leaving {child_id} unlinked");
+        return;
+    };
+    let Some(ids) = object
+        .entry("childConversationIds")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+    else {
+        return;
+    };
+    ids.push(Value::String(child_id.to_string()));
+    let position = ids.len() - 1;
+    let Some(prompts) = object
+        .entry("childPrompts")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+    else {
+        return;
+    };
+    // Prompts stay positionally aligned with the ids.
+    prompts.resize(position, Value::String(String::new()));
+    prompts.push(Value::String(label.unwrap_or("").to_string()));
+    state
+        .child_links
+        .insert(child_id.to_string(), (idx, position));
+}
+
+/// The last usage chunk a model attempt streamed.
+fn last_stream_usage(data: &Value) -> Option<TokenUsage> {
+    data.get("stream")?
+        .as_array()?
+        .iter()
+        .rev()
+        .filter_map(|record| record.get("chunk"))
+        .filter(|chunk| chunk.get("type").and_then(Value::as_str) == Some("usage"))
+        .find_map(|chunk| {
+            chunk
+                .get("usage")
+                .and_then(|usage| token_usage_from(usage, &DSH_USAGE_KEYS))
+        })
+}
+
+/// A user slash command (`/compact`, `/plan …`, a permission switch, …) as
+/// the command line the user issued. `args` is the verbatim raw input,
+/// separator included; it is absent when a domain event owns the input.
+fn handle_command_run(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
+    let Some(name) = data
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        log::warn!("skipping DSH command/run without a command name");
+        state.note_warning();
+        return;
+    };
+    let args = data.get("args").and_then(Value::as_str).unwrap_or("");
+    let line = format!("/{name}{args}").trim_end().to_string();
+    state.content_parts.push(line.clone());
+    state.messages.push(Message {
+        timestamp,
+        ..Message::command_input(line)
+    });
+}
+
+/// The settled command's verbatim outcome text, as command output.
+fn handle_command_done(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
+    if data.get("kind").and_then(Value::as_str).is_none() {
+        log::warn!("skipping DSH command/done without an outcome kind");
+        state.note_warning();
+        return;
+    }
+    let Some(text) = data
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return;
+    };
+    state.content_parts.push(text.to_string());
+    state.messages.push(Message {
+        timestamp,
+        ..Message::command_output(text)
+    });
+}
+
+/// A model request retry: `[retry] retry <n>/<max> after <ms> ms (<code>)`
+/// plus the failure message (`always` mode has no retry ceiling, so no
+/// `/<max>`).
+fn handle_llm_retry(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
+    let (Some(retry), Some(delay_ms)) = (
+        data.get("retry").and_then(Value::as_u64),
+        data.get("delayMs").and_then(Value::as_f64),
+    ) else {
+        log::warn!("skipping DSH llm/retry without retry details");
+        state.note_warning();
+        return;
+    };
+    let attempt = match data.get("maxRetries").and_then(Value::as_u64) {
+        Some(max) => format!("{retry}/{max}"),
+        None => retry.to_string(),
+    };
+    let mut summary = format!("retry {attempt} after {} ms", delay_ms.round());
+    if let Some(code) = data.pointer("/failure/code").and_then(Value::as_str) {
+        summary.push_str(&format!(" ({code})"));
+    }
+    let content = match data
+        .pointer("/failure/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        Some(message) => format!("[retry] {summary}\n{message}"),
+        None => format!("[retry] {summary}"),
+    };
+    state.messages.push(Message {
+        timestamp,
+        ..Message::system(content)
+    });
+}
+
+/// A turn that ended other than `completed` surfaces as a tagged status line.
+fn handle_turn_end(data: &Value, state: &mut ParseState, timestamp: Option<String>) {
+    let reason = data.get("reason").unwrap_or(&MISSING);
+    let Some(kind) = reason.get("kind").and_then(Value::as_str) else {
+        log::warn!("skipping DSH turn/end without a reason kind");
+        state.note_warning();
+        return;
+    };
+    let content = match kind {
+        // A fork seed's closer marks the copy boundary, not an outcome.
+        "completed" | "forked" => return,
+        "error" => {
+            let message = reason
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty());
+            message.map_or_else(
+                || "[turn_failed]".to_string(),
+                |message| format!("[turn_failed]\n{message}"),
+            )
+        }
+        "aborted" => match reason.pointer("/reason/kind").and_then(Value::as_str) {
+            Some("hook") => {
+                let detail = reason
+                    .pointer("/reason/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("hook");
+                format!("[turn_cancelled] hook: {detail}")
+            }
+            Some(cause @ ("parent" | "disposed")) => format!("[turn_cancelled] {cause}"),
+            _ => "[turn_cancelled]".to_string(),
+        },
+        "interrupted" => "[turn_interrupted]".to_string(),
+        "blocked" => "[turn_blocked]".to_string(),
+        "max-tokens" => "[turn_max_tokens]".to_string(),
+        other => format!("[turn_ended] {other}"),
+    };
+    state.messages.push(Message {
+        timestamp,
+        ..Message::system(content)
     });
 }
 
@@ -1068,24 +1550,7 @@ fn flush_step_chunks(state: &mut ParseState, turn: u32, step: u32) {
     // `usage_events` and on the flush's last non-System message, so an
     // interrupted step still counts toward the session's tokens.
     if let Some(usage) = buf.usage {
-        match (buf.usage_timestamp.as_deref(), state.model.clone()) {
-            (Some(timestamp), Some(model)) => state.usage_events.push(UsageEvent {
-                timestamp: timestamp.to_string(),
-                model,
-                turn_count: 1,
-                input_tokens: u64::from(usage.input_tokens),
-                output_tokens: u64::from(usage.output_tokens),
-                cache_read_input_tokens: u64::from(usage.cache_read_input_tokens),
-                cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
-                usage_hash: None,
-                cost_is_estimate: false,
-                cost_usd: None,
-            }),
-            _ => {
-                log::warn!("skipping DSH usage chunk without a timestamp or model");
-                state.parse_warning_count = state.parse_warning_count.saturating_add(1);
-            }
-        }
+        state.push_usage_event(&usage, None, buf.usage_timestamp.as_deref());
         if let Some(last) = state.messages[produced_start..]
             .iter_mut()
             .filter(|message| message.role != MessageRole::System)
@@ -1099,6 +1564,23 @@ fn flush_step_chunks(state: &mut ParseState, turn: u32, step: u32) {
             });
         }
     }
+}
+
+/// `$DSH_HOME/attachments/v1/objects` for a log at
+/// `$DSH_HOME/sessions/<project-key>/<session-id>/<artifact>`; `None` for a
+/// log outside that layout.
+fn attachment_objects_dir(path: &Path) -> Option<PathBuf> {
+    let sessions = path.ancestors().nth(3)?;
+    if sessions.file_name()? != "sessions" {
+        return None;
+    }
+    Some(
+        sessions
+            .parent()?
+            .join("attachments")
+            .join("v1")
+            .join("objects"),
+    )
 }
 
 /// Parse one DSH session artifact into a [`ParsedSession`]. Returns `None`
@@ -1135,7 +1617,10 @@ pub fn parse_session_file(path: &Path) -> Option<ParsedSession> {
             return None;
         }
     };
-    let mut state = ParseState::default();
+    let mut state = ParseState {
+        attachment_objects: attachment_objects_dir(path),
+        ..ParseState::default()
+    };
     let header = scan_records(reader, path, &mut state)?;
     if state.seed_cut.take().is_some() {
         // The log ends inside its inherited prefix: nothing is local yet.
@@ -1195,18 +1680,26 @@ fn assemble_session_meta(
     // `parentSession` alone is seed lineage — a forked/resumed branch carries
     // it too. Only `origin: "subagent"` marks a delegated child.
     let is_sidechain = header.origin.as_deref() == Some("subagent");
-    // A delegated session's `session/title` is only the deterministic
-    // fallback (auto-titling skips subagents), so the parent-chosen
-    // delegation label wins when present. `first_user_text` is set by
-    // `push_user` for every surfaced direct prompt, so it is exactly the
-    // first User message's text; no scan needed.
+    // A delegated session is never auto-titled, so the parent-chosen
+    // delegation label wins when present. DSH's `fallback` title is only the
+    // prompt's leading words — sibling workflow agents share it — so the full
+    // first prompt outranks it. `first_user_text` is set by `push_user` for
+    // every surfaced direct prompt, so it is exactly the first User message's
+    // text; no scan needed.
     let title = if is_sidechain {
         state.descriptor_label.clone()
     } else {
         None
     }
     .or_else(|| state.latest_title.clone())
-    .unwrap_or_else(|| session_title(state.first_user_text.as_deref()));
+    .or_else(|| {
+        state
+            .first_user_text
+            .as_deref()
+            .map(|text| session_title(Some(text)))
+    })
+    .or_else(|| state.fallback_title.clone())
+    .unwrap_or_else(|| session_title(None));
     SessionMeta {
         id,
         provider: Provider::Dsh,
@@ -1489,7 +1982,7 @@ mod tests {
                     "session/title",
                     5,
                     1786865134000,
-                    r#"{"title":"A Great Title","messageSeqs":[1],"source":{"kind":"fallback"}}"#,
+                    r#"{"title":"A Great Title","messageSeqs":[1],"source":{"kind":"provider","provider":"session-title-first-prompt-llm"}}"#,
                 ),
             ],
         );
@@ -1828,7 +2321,7 @@ mod tests {
                 "llm/retry",
                 1,
                 1000,
-                r#"{"retryId":"r-1","turn":1,"step":1,"provider":"opencode-go","retry":1,"maxRetries":2,"failure":{"message":"boom","code":"TRANSPORT"}}"#,
+                r#"{"retryId":"r-1","turn":1,"step":1,"provider":"opencode-go","mode":"normal","retry":1,"maxRetries":2,"delayMs":512.4,"failure":{"message":"boom","code":"TRANSPORT"}}"#,
             ),
             &event_line(
                 "llm/retry-started",
@@ -1844,7 +2337,18 @@ mod tests {
             ),
             &user_message_line(4, 1003, r#"{"kind":"user"}"#, r#""still works""#),
         ]);
-        assert_eq!(session.messages.len(), 1);
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "[retry] retry 1/2 after 512 ms (TRANSPORT)\nboom",
+                "still works"
+            ]
+        );
         assert_eq!(session.parse_warning_count, 0);
     }
 
@@ -2029,18 +2533,6 @@ mod tests {
                 1001,
                 r#"{"turn":1,"step":1,"stream":[{"type":"chunk","time":1001,"chunk":{"type":"usage","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0}}},{"type":"chunk","time":1001,"chunk":{"type":"finish","reason":{"kind":"error"}}}]}"#,
             ),
-            &event_line(
-                "tool/ptc-dispatch-start",
-                3,
-                1002,
-                r#"{"rootCallId":"call_1","parentCallId":"call_1","subCallId":"call_1:code:1","name":"bash"}"#,
-            ),
-            &event_line(
-                "tool/ptc-dispatch",
-                4,
-                1003,
-                r#"{"rootCallId":"call_1","parentCallId":"call_1","subCallId":"call_1:code:1","name":"bash","isError":false,"content":[{"type":"text","text":"detail"}]}"#,
-            ),
             &event_line("workspace/changes", 5, 1004, r#"{"turn":1}"#),
             &event_line(
                 "model/selection",
@@ -2070,6 +2562,8 @@ mod tests {
         ]);
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "hello");
+        // A failed attempt that reported zero tokens bills nothing.
+        assert!(session.usage_events.is_empty());
         assert_eq!(session.parse_warning_count, 0);
     }
 
@@ -2320,5 +2814,714 @@ mod tests {
             // The inherited prefix still renders.
             assert_eq!(session.messages[0].content, "parent prompt");
         }
+    }
+
+    /// Two zstd frames — `first` lines, then `second` lines — the way DSH
+    /// appends one checksummed frame per durable batch.
+    fn two_frame_log(first: &[&str], second: &[&str]) -> (Vec<u8>, usize) {
+        let frame = |lines: &[&str]| {
+            zstd::stream::encode_all((lines.join("\n") + "\n").as_bytes(), 3).unwrap()
+        };
+        let mut bytes = frame(first);
+        let first_len = bytes.len();
+        bytes.extend(frame(second));
+        (bytes, first_len)
+    }
+
+    #[test]
+    fn torn_final_zstd_frame_keeps_the_complete_records() {
+        let header = versioned_header_line(4, "/tmp/p");
+        let prompt = user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""kept""#);
+        let lost = user_message_line(2, 1001, r#"{"kind":"user"}"#, r#""lost""#);
+        let (bytes, first_len) = two_frame_log(&[&header, &prompt], &[&lost]);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.v4.jsonl.zstd");
+        // Cut the second frame mid-write.
+        std::fs::write(&path, &bytes[..first_len + (bytes.len() - first_len) / 2]).unwrap();
+
+        let session = parse_session_file(&path).expect("torn log must still parse");
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["kept"]);
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn corrupt_zstd_data_keeps_the_readable_prefix_as_a_warning() {
+        let header = versioned_header_line(4, "/tmp/p");
+        let prompt = user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""kept""#);
+        let (mut bytes, first_len) = two_frame_log(&[&header, &prompt], &[&prompt]);
+        bytes.truncate(first_len);
+        bytes.extend_from_slice(b"definitely not a zstd frame, but complete bytes");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.v4.jsonl.zstd");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let session = parse_session_file(&path).expect("prefix must still parse");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.parse_warning_count, 1);
+    }
+
+    /// DSH 0.2's complete event vocabulary (`KNOWN_SESSION_EVENT_TYPES` in
+    /// `@deepseek-ai/dsh-session`). None of these may count as unknown.
+    const KNOWN_DSH_EVENT_TYPES: &[&str] = &[
+        "agent-preset/selected",
+        "agent/inbox/spliced",
+        "approval/asked",
+        "approval/decided",
+        "approval/policy",
+        "assistant/attempt",
+        "assistant/message",
+        "command/done",
+        "command/run",
+        "compaction/end",
+        "compaction/prune",
+        "compaction/start",
+        "compaction/summary",
+        "deliverables/presented",
+        "developer/message",
+        "feedback/message-delete",
+        "feedback/message-put",
+        "feedback/record",
+        "goal/change",
+        "hook/invoked",
+        "hook/result",
+        "image/offload",
+        "llm/retry",
+        "llm/retry-started",
+        "model/selection",
+        "permission/preset",
+        "plan/mode",
+        "request/context",
+        "request/header",
+        "sandbox/mode",
+        "schedule/change",
+        "session-log-deepseek/delivery-accepted",
+        "session/end-seed",
+        "session/title",
+        "session/title-llm-request",
+        "step/end",
+        "step/start",
+        "subagent/catalog",
+        "subagent/descriptor",
+        "subagent/model-selection-policy",
+        "system/message",
+        "team/member",
+        "team/message/delivered",
+        "team/message/queued",
+        "team/task",
+        "todo/write",
+        "tool-workflow/agent-end",
+        "tool-workflow/agent-start",
+        "tool-workflow/run-end",
+        "tool-workflow/run-start",
+        "tool/call",
+        "tool/ptc-dispatch",
+        "tool/ptc-dispatch-start",
+        "tool/result",
+        "turn/end",
+        "turn/start",
+        "user/message",
+        "web/deepseek-search-llm-request",
+        "workspace/changes",
+    ];
+
+    #[test]
+    fn every_known_dsh_event_type_parses_without_warnings() {
+        let payload = |event_type: &str| match event_type {
+            "agent-preset/selected" => r#"{"agentPreset":"standard"}"#,
+            "command/run" => r#"{"commandId":"c1","name":"compact","source":{"kind":"user"}}"#,
+            "command/done" => r#"{"commandId":"c1","kind":"success"}"#,
+            "llm/retry" => r#"{"retry":1,"delayMs":500,"failure":{"code":"SERVER"}}"#,
+            "turn/end" => r#"{"turn":1,"reason":{"kind":"completed"}}"#,
+            "tool/ptc-dispatch-start" => {
+                r#"{"rootCallId":"c","parentCallId":"c","subCallId":"c:ptc:1","name":"bash","arguments":{}}"#
+            }
+            "tool/ptc-dispatch" => {
+                r#"{"rootCallId":"c","parentCallId":"c","subCallId":"c:ptc:1","name":"bash","arguments":{},"content":[]}"#
+            }
+            _ => "{}",
+        };
+        let events: Vec<String> = KNOWN_DSH_EVENT_TYPES
+            .iter()
+            .zip(2u64..)
+            .map(|(event_type, seq)| event_line(event_type, seq, 1000, payload(event_type)))
+            .collect();
+        let mut lines = vec![
+            versioned_header_line(4, "/tmp/p"),
+            user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hello""#),
+        ];
+        lines.extend(events);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let session = parse_lines(&lines);
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn compaction_and_failed_attempt_usage_is_counted() {
+        let attempt = event_line(
+            "assistant/attempt",
+            3,
+            2000,
+            r#"{"turn":1,"step":1,"stream":[{"type":"chunk","time":2000,"chunk":{"type":"usage","usage":{"inputTokens":7,"outputTokens":3}}},{"type":"chunk","time":2000,"chunk":{"type":"finish","reason":{"kind":"error"}}}]}"#,
+        );
+        let summary = event_line(
+            "compaction/summary",
+            4,
+            3000,
+            r#"{"compactionId":"c1","summary":[],"provider":"p","model":"m-sum","usage":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":5}}"#,
+        );
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &event_line(
+                "request/context",
+                1,
+                1000,
+                r#"{"provider":"p","model":"m-route","contextWindow":1000}"#,
+            ),
+            &user_message_line(2, 1000, r#"{"kind":"user"}"#, r#""go""#),
+            &attempt,
+            &summary,
+        ]);
+        let rows: Vec<(&str, u64, u64, u64)> = session
+            .usage_events
+            .iter()
+            .map(|event| {
+                (
+                    event.model.as_str(),
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.cache_read_input_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(rows, [("m-route", 7, 3, 0), ("m-sum", 100, 20, 5)]);
+        assert_eq!(session.parse_warning_count, 0);
+
+        // A fork's inherited compaction was billed to the parent.
+        let fork_header = format!(
+            r#"{{"type":"session","version":4,"id":"{SESSION_ID}","createdAt":1,"cwd":"/tmp/p","isSeeded":true,"parentSession":"session-parent","delegationDepth":0}}"#
+        );
+        let session = parse_lines(&[
+            &fork_header,
+            &user_message_line(2, 1000, r#"{"kind":"user"}"#, r#""go""#),
+            &summary,
+            &event_line("session/end-seed", 5, 3001, r#"{"inherited":true}"#),
+        ]);
+        assert!(session.usage_events.is_empty());
+    }
+
+    #[test]
+    fn unfinished_turns_surface_as_status_rows() {
+        let turn_end = |seq: u64, reason: &str| {
+            event_line(
+                "turn/end",
+                seq,
+                1000 + seq as i64,
+                &format!(r#"{{"turn":1,"reason":{reason}}}"#),
+            )
+        };
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""go""#),
+            &turn_end(2, r#"{"kind":"completed"}"#),
+            &turn_end(
+                3,
+                r#"{"kind":"error","error":{"message":"Authentication Fails","code":"AUTH","status":401}}"#,
+            ),
+            &turn_end(4, r#"{"kind":"aborted","reason":{"kind":"user"}}"#),
+            &turn_end(
+                5,
+                r#"{"kind":"aborted","reason":{"kind":"hook","reason":"stop requested"}}"#,
+            ),
+            &turn_end(6, r#"{"kind":"aborted","reason":{"kind":"parent"}}"#),
+            &turn_end(7, r#"{"kind":"interrupted"}"#),
+            &turn_end(8, r#"{"kind":"blocked"}"#),
+            &turn_end(9, r#"{"kind":"max-tokens"}"#),
+            &turn_end(10, r#"{"kind":"forked"}"#),
+            &turn_end(11, r#"{"kind":"goal-limit"}"#),
+        ]);
+        let rows: Vec<&str> = session.messages[1..]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "[turn_failed]\nAuthentication Fails",
+                "[turn_cancelled]",
+                "[turn_cancelled] hook: stop requested",
+                "[turn_cancelled] parent",
+                "[turn_interrupted]",
+                "[turn_blocked]",
+                "[turn_max_tokens]",
+                "[turn_ended] goal-limit",
+            ]
+        );
+        assert!(
+            session.messages[1..]
+                .iter()
+                .all(|m| m.role == MessageRole::System)
+        );
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    fn child_links(message: &Message) -> (Vec<String>, Vec<String>) {
+        let structured = message
+            .tool_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.structured.as_ref());
+        let list = |key: &str| -> Vec<String> {
+            structured
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        (list("childConversationIds"), list("childPrompts"))
+    }
+
+    #[test]
+    fn delegated_children_link_to_the_tool_call_that_spawned_them() {
+        let catalog = |seq: u64, child: &str, label: Option<&str>| {
+            let label = label.map_or(String::new(), |label| format!(r#","label":"{label}""#));
+            event_line(
+                "subagent/catalog",
+                seq,
+                1000,
+                &format!(
+                    r#"{{"version":0,"childId":"{child}","childCreatedAt":1,"mode":"one-shot"{label}}}"#
+                ),
+            )
+        };
+        let agent_start = |seq: u64, child: &str, label: &str| {
+            event_line(
+                "tool-workflow/agent-start",
+                seq,
+                1000,
+                &format!(r#"{{"runId":"r1","seq":{seq},"label":"{label}","childId":"{child}"}}"#),
+            )
+        };
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""delegate""#),
+            &tool_call_line(
+                2,
+                1001,
+                "call-sub",
+                "subagent",
+                r#""{\"description\":\"Count lines\"}""#,
+            ),
+            &catalog(3, "child-a", Some("Count lines")),
+            &v4_tool_result_line(4, "call-sub", r#""12 lines""#, false, ""),
+            &tool_call_line(
+                5,
+                1005,
+                "call-wf",
+                "workflow",
+                r#""{\"script\":\"phase()\"}""#,
+            ),
+            &event_line(
+                "tool-workflow/run-start",
+                6,
+                1006,
+                r#"{"runId":"r1","name":"w"}"#,
+            ),
+            &catalog(7, "child-b", None),
+            &agent_start(8, "child-b", "agent A"),
+            &catalog(9, "child-c", None),
+            &agent_start(10, "child-c", "agent B"),
+            &v4_tool_result_line(11, "call-wf", r#""done""#, false, ""),
+            // No delegating call is open: the child stays unlinked.
+            &catalog(12, "child-d", Some("stray")),
+        ]);
+        let tools = tool_messages(&session);
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.tool_name.as_deref() == Some("Agent"))
+        );
+        assert_eq!(
+            child_links(tools[0]),
+            (vec!["child-a".to_string()], vec!["Count lines".to_string()])
+        );
+        assert_eq!(
+            child_links(tools[1]),
+            (
+                vec!["child-b".to_string(), "child-c".to_string()],
+                vec!["agent A".to_string(), "agent B".to_string()]
+            )
+        );
+        assert_eq!(tools[1].content, "done");
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn ptc_sub_calls_surface_as_their_own_tool_messages() {
+        let start = |seq: u64, sub: &str, name: &str, arguments: &str| {
+            event_line(
+                "tool/ptc-dispatch-start",
+                seq,
+                1000,
+                &format!(
+                    r#"{{"rootCallId":"call-code","parentCallId":"call-code","subCallId":"{sub}","name":"{name}","arguments":{arguments}}}"#
+                ),
+            )
+        };
+        let settle = |seq: u64, sub: &str, name: &str, error: bool, text: &str| {
+            event_line(
+                "tool/ptc-dispatch",
+                seq,
+                1000,
+                &format!(
+                    r#"{{"rootCallId":"call-code","parentCallId":"call-code","subCallId":"{sub}","name":"{name}","arguments":{{"x":1}},"isError":{error},"content":[{{"type":"text","text":"{text}"}}]}}"#
+                ),
+            )
+        };
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""run code""#),
+            &tool_call_line(
+                2,
+                1001,
+                "call-code",
+                "run_code",
+                r#""{\"code\":\"await tools.bash()\"}""#,
+            ),
+            &start(3, "call-code:ptc:1", "bash", r#"{"command":"echo ok"}"#),
+            &start(
+                4,
+                "call-code:ptc:2",
+                "read",
+                r#"{"file_path":"missing.txt"}"#,
+            ),
+            &settle(5, "call-code:ptc:1", "bash", false, "ok"),
+            &settle(6, "call-code:ptc:2", "read", true, "no such file"),
+            // A settle whose start was never logged still surfaces.
+            &settle(7, "call-code:ptc:3", "glob", false, "a.py"),
+            &v4_tool_result_line(8, "call-code", r#""returned""#, false, ""),
+        ]);
+        let tools = tool_messages(&session);
+        let summary: Vec<(&str, &str, Option<&str>)> = tools
+            .iter()
+            .map(|tool| {
+                (
+                    tool.tool_name.as_deref().unwrap_or(""),
+                    tool.content.as_str(),
+                    tool.tool_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.status.as_deref()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("run_code", "returned", Some("success")),
+                ("Bash", "ok", Some("success")),
+                ("Read", "no such file", Some("error")),
+                ("Glob", "a.py", Some("success")),
+            ]
+        );
+        assert_eq!(
+            tools[1].tool_input.as_deref(),
+            Some(r#"{"command":"echo ok"}"#)
+        );
+        assert_eq!(tools[3].tool_input.as_deref(), Some(r#"{"x":1}"#));
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn image_blocks_resolve_their_stored_attachment() {
+        let home = TempDir::new().unwrap();
+        let stored = "ab".repeat(32);
+        let missing = "cd".repeat(32);
+        let objects = home.path().join("attachments/v1/objects");
+        std::fs::create_dir_all(objects.join("ab")).unwrap();
+        std::fs::write(objects.join("ab").join(&stored), b"\x89PNG\r\n\x1a\n").unwrap();
+        let session_dir = home.path().join("sessions/--tmp-p--").join(SESSION_ID);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let image = |id: &str| {
+            format!(
+                r#"{{"type":"image","attachment":{{"attachmentId":"{id}","mediaType":"image/png","bytes":8,"width":1,"height":1}}}}"#
+            )
+        };
+        let user = event_line(
+            "user/message",
+            1,
+            1000,
+            &format!(
+                r#"{{"content":[{{"type":"text","text":"look"}},{},{},{}],"source":{{"kind":"user"}},"role":"user","id":"u1"}}"#,
+                image(&format!("sha256:{stored}")),
+                image(&format!("sha256:{missing}")),
+                image("sha256:../../../etc/passwd"),
+            ),
+        );
+        let log = format!("{}\n{user}\n", versioned_header_line(4, "/tmp/p"));
+        let path = session_dir.join("session.v4.jsonl");
+        std::fs::write(&path, log).unwrap();
+
+        let session = parse_session_file(&path).expect("fixture must parse");
+        let stored_path = objects.join("ab").join(&stored);
+        assert_eq!(
+            session.messages[0].content,
+            format!(
+                "look\n[Image: source: {}]\n[Image]\n[Image]",
+                stored_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn fallback_titles_yield_to_the_first_prompt() {
+        let fallback = event_line(
+            "session/title",
+            3,
+            1002,
+            r#"{"title":"Use the bash tool","messageSeqs":[2],"source":{"kind":"fallback"}}"#,
+        );
+        let descriptor = event_line(
+            "subagent/descriptor",
+            1,
+            1000,
+            r#"{"version":3,"mode":"one-shot","provider":"spawn"}"#,
+        );
+        let prompt = user_message_line(
+            2,
+            1001,
+            r#"{"kind":"user"}"#,
+            r#""Use the bash tool exactly once to run: ls -1""#,
+        );
+        // An unlabeled workflow agent: the full prompt, not DSH's prefix.
+        let session = parse_lines(&[
+            &subagent_header_line("/tmp/p"),
+            &descriptor,
+            &prompt,
+            &fallback,
+        ]);
+        assert_eq!(
+            session.meta.title,
+            "Use the bash tool exactly once to run: ls -1"
+        );
+
+        // An LLM title still outranks the prompt.
+        let llm_title = event_line(
+            "session/title",
+            4,
+            1003,
+            r#"{"title":"List files","messageSeqs":[2],"source":{"kind":"provider","provider":"session-title-first-prompt-llm"}}"#,
+        );
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &prompt,
+            &fallback,
+            &llm_title,
+        ]);
+        assert_eq!(session.meta.title, "List files");
+
+        // Without a direct prompt, the fallback title is still a title.
+        let relay = user_message_line(
+            2,
+            1001,
+            r#"{"kind":"agent-message","form":"relay"}"#,
+            r#""Agent x sent a message""#,
+        );
+        let session = parse_lines(&[&versioned_header_line(4, "/tmp/p"), &relay, &fallback]);
+        assert_eq!(session.meta.title, "Use the bash tool");
+    }
+
+    #[test]
+    fn user_attached_files_render_as_file_markers() {
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &event_line(
+                "user/message",
+                1,
+                1000,
+                r#"{"content":[{"type":"image","attachment":{"attachmentId":"sha256:00","mediaType":"image/png","bytes":1,"width":1,"height":1}},{"type":"file","attachment":{"attachmentId":"sha256:11","name":"notes.txt","mediaType":"text/plain","bytes":21}},{"type":"file","attachment":{"attachmentId":"sha256:22","bytes":3}},{"type":"text","text":"read these"}],"source":{"kind":"user"},"role":"user","id":"u1"}"#,
+            ),
+        ]);
+        assert_eq!(
+            session.messages[0].content,
+            "read these\n[Image]\n[File: notes.txt]\n[File]"
+        );
+        assert_eq!(session.parse_warning_count, 0);
+    }
+
+    #[test]
+    fn slash_commands_render_as_command_rows() {
+        let run = |seq: u64, id: &str, name: &str, args: Option<&str>| {
+            let args = args.map_or(String::new(), |args| format!(r#","args":"{args}""#));
+            event_line(
+                "command/run",
+                seq,
+                1000,
+                &format!(
+                    r#"{{"commandId":"{id}","name":"{name}"{args},"source":{{"kind":"user"}}}}"#
+                ),
+            )
+        };
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &run(1, "c1", "compact", Some("")),
+            &event_line(
+                "command/done",
+                2,
+                1001,
+                r#"{"commandId":"c1","kind":"success","text":"Compacted 38 history items (~3961 tokens)."}"#,
+            ),
+            &run(3, "c2", "permission", Some(" read-only")),
+            &event_line(
+                "command/done",
+                4,
+                1002,
+                r#"{"commandId":"c2","kind":"success","text":"preset read-only"}"#,
+            ),
+            // A domain event owns this input, so the run records no args.
+            &run(5, "c3", "goal", None),
+            &event_line(
+                "command/done",
+                6,
+                1003,
+                r#"{"commandId":"c3","kind":"error","text":"No active goal."}"#,
+            ),
+            // A silent success adds no output row.
+            &run(7, "c4", "plan", Some(" off")),
+            &event_line(
+                "command/done",
+                8,
+                1004,
+                r#"{"commandId":"c4","kind":"success"}"#,
+            ),
+        ]);
+        use crate::models::MessageKind::{self, CommandInput, CommandOutput};
+        let rows: Vec<(Option<MessageKind>, &str)> = session
+            .messages
+            .iter()
+            .map(|m| (m.message_kind.clone(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some(CommandInput), "/compact"),
+                (
+                    Some(CommandOutput),
+                    "Compacted 38 history items (~3961 tokens)."
+                ),
+                (Some(CommandInput), "/permission read-only"),
+                (Some(CommandOutput), "preset read-only"),
+                (Some(CommandInput), "/goal"),
+                (Some(CommandOutput), "No active goal."),
+                (Some(CommandInput), "/plan off"),
+            ]
+        );
+        assert_eq!(session.parse_warning_count, 0);
+
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hi""#),
+            &event_line(
+                "command/run",
+                2,
+                1001,
+                r#"{"commandId":"c1","source":{"kind":"user"}}"#,
+            ),
+            &event_line("command/done", 3, 1002, r#"{"commandId":"c1","text":"?"}"#),
+        ]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.parse_warning_count, 2);
+    }
+
+    #[test]
+    fn retries_surface_as_status_rows() {
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""hi""#),
+            &event_line(
+                "llm/retry",
+                2,
+                1001,
+                r#"{"retryId":"r1","turn":1,"step":1,"provider":"p","mode":"normal","policyKey":"k","retry":2,"maxRetries":5,"delayMs":947.83,"failure":{"message":"DeepSeek Messages transport failed","code":"TRANSPORT"}}"#,
+            ),
+            &event_line(
+                "llm/retry-started",
+                3,
+                1002,
+                r#"{"retryId":"r1","turn":1,"step":1,"retry":2}"#,
+            ),
+            &event_line(
+                "llm/retry",
+                4,
+                1003,
+                r#"{"retryId":"r2","turn":1,"step":1,"provider":"p","mode":"always","policyKey":"k","retry":7,"delayMs":10000,"failure":{"message":"","code":"RATE_LIMIT"}}"#,
+            ),
+            &event_line(
+                "llm/retry",
+                5,
+                1004,
+                r#"{"retryId":"r3","failure":{"code":"SERVER"}}"#,
+            ),
+        ]);
+        let rows: Vec<&str> = session.messages[1..]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "[retry] retry 2/5 after 948 ms (TRANSPORT)\nDeepSeek Messages transport failed",
+                "[retry] retry 7 after 10000 ms (RATE_LIMIT)",
+            ]
+        );
+        // The retry without its details is a counted warning, not a row.
+        assert_eq!(session.parse_warning_count, 1);
+    }
+
+    #[test]
+    fn session_references_name_the_referenced_sessions() {
+        let reference = |seq: u64, references: &str| {
+            event_line(
+                "user/message",
+                seq,
+                1000,
+                &format!(
+                    r##"{{"content":[{{"type":"text","text":"Referenced sessions\n{{\"events\":[]}}"}}],"source":{{"kind":"session-reference","form":"recall","version":1,"references":{references}}},"role":"user","id":"u{seq}"}}"##
+                ),
+            )
+        };
+        let session = parse_lines(&[
+            &versioned_header_line(4, "/tmp/p"),
+            &user_message_line(1, 1000, r#"{"kind":"user"}"#, r#""what did it do?""#),
+            &reference(
+                2,
+                r#"[{"sessionId":"session-a","label":"Read image and run echo","capturedThroughSeq":30,"capturedFormatVersion":4},{"sessionId":"session-b","capturedThroughSeq":3,"capturedFormatVersion":4}]"#,
+            ),
+            &reference(3, "[]"),
+        ]);
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "what did it do?",
+                "[session_reference]\nRead image and run echo\nsession-b",
+            ]
+        );
+        // The recalled snapshot itself never reaches the transcript.
+        assert!(!session.content_text.contains("events"));
+        assert_eq!(session.parse_warning_count, 1);
     }
 }

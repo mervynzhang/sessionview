@@ -172,10 +172,34 @@ const SYSTEM_SUBTYPE_CONFIG: Record<
     labelKey: "system.stepInterrupted",
     cls: "sys-error",
   },
+  // DSH turn outcomes beyond Kimi's: a crash-orphaned turn closed on resume,
+  // an output-token ceiling, and a plugin-defined reason (`[turn_ended] <kind>`).
+  turn_interrupted: {
+    icon: "\u23F9",
+    labelKey: "system.turnInterrupted",
+    cls: "sys-error",
+  },
+  turn_max_tokens: {
+    icon: "\u26A0",
+    labelKey: "system.turnMaxTokens",
+    cls: "sys-info",
+  },
+  turn_ended: {
+    icon: "\u23F9",
+    labelKey: "system.turnEnded",
+    cls: "sys-info",
+  },
   retry: {
     icon: "\uD83D\uDD01",
     labelKey: "system.retry",
     cls: "sys-info",
+  },
+  // DSH sessions the user referenced, one label per line.
+  session_reference: {
+    icon: "\uD83D\uDCCE",
+    labelKey: "system.sessionReference",
+    cls: "sys-info",
+    collapsible: true,
   },
   // DSH files the harness presented to the user, one per line.
   deliverables: {
