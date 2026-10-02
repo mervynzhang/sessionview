@@ -34,6 +34,7 @@ import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import {
   getChildSessions,
+  getSessionMeta,
   startRebuildIndex,
   getIndexStats,
   getTodayCost,
@@ -276,6 +277,7 @@ export default function App() {
           .map((g) => g.activeTabId)
           .filter((id): id is string => id != null),
       getChildSessions,
+      getSessionMeta,
       openSession,
       onLoadFailed: () => toastError(tRef.current("toast.subagentLoadFailed")),
       onNotFound: () => toastError(tRef.current("toast.subagentNotFound")),

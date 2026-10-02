@@ -79,6 +79,9 @@ describe("openSubagent", () => {
             session({ id: "agent-child-2", title: "Second child" }),
           ];
         },
+        getSessionMeta: async (id) => {
+          throw new Error(`session not found: ${id}`);
+        },
         openSession: (child) => opened.push(child),
         onLoadFailed: () => {
           loadFailed += 1;
@@ -117,6 +120,9 @@ describe("openSubagent", () => {
             }),
           ];
         },
+        getSessionMeta: async (id) => {
+          throw new Error(`session not found: ${id}`);
+        },
         openSession: (child) => opened.push(child),
         onLoadFailed: () => {
           throw new Error("should not report total load failure");
@@ -142,6 +148,9 @@ describe("openSubagent", () => {
         getActiveParentSessionIds: () => ["parent-1"],
         getChildSessions: async () => {
           throw new Error("IPC failed");
+        },
+        getSessionMeta: async (id) => {
+          throw new Error(`session not found: ${id}`);
         },
         openSession: () => {
           throw new Error("should not open a child");
@@ -170,6 +179,9 @@ describe("openSubagent", () => {
         getChildSessions: async () => [
           session({ id: "child-1", title: "Ada" }),
         ],
+        getSessionMeta: async (id) => {
+          throw new Error(`session not found: ${id}`);
+        },
         openSession: () => {
           throw new Error("should not open a child");
         },
@@ -184,5 +196,44 @@ describe("openSubagent", () => {
 
     expect(loadFailed).toBe(0);
     expect(notFound).toBe(1);
+  });
+
+  it("opens a child outside the parent's children by its exact session id", async () => {
+    // A forked session's inherited delegation belongs to the session it was
+    // forked from, so the fork's own children never include it.
+    const opened: SessionRef[] = [];
+    let notFound = 0;
+
+    await openSubagent(
+      { agentId: "child-of-origin", parentSessionId: "fork-1" },
+      {
+        getActiveParentSessionIds: () => [],
+        getChildSessions: async () => [],
+        getSessionMeta: async (id) => ({
+          ...session({ id, provider: "dsh", is_sidechain: true }),
+          parent_id: "origin-1",
+          project_path: "/p",
+          created_at: 0,
+          updated_at: 0,
+          message_count: 1,
+          file_size_bytes: 0,
+          source_path: "/p/s",
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+        }),
+        openSession: (child) => opened.push(child),
+        onLoadFailed: () => {
+          throw new Error("should not report load failure");
+        },
+        onNotFound: () => {
+          notFound += 1;
+        },
+      },
+    );
+
+    expect(opened.map((child) => child.id)).toEqual(["child-of-origin"]);
+    expect(notFound).toBe(0);
   });
 });

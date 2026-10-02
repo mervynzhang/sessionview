@@ -46,6 +46,26 @@ export interface SubagentMatchCandidate {
   title: string;
 }
 
+/**
+ * Resolve a delegated child by its exact session id. This reaches children
+ * outside the viewed session's own — a forked session's inherited delegations
+ * belong to the session it was forked from. Only a session that has a parent
+ * qualifies; a rejected lookup means the id names no indexed session.
+ */
+export async function findChildSessionById<T extends { parent_id?: string }>(
+  agentId: string | undefined,
+  getSessionMeta: (sessionId: string) => Promise<T>,
+): Promise<T | undefined> {
+  const id = agentId?.trim();
+  if (!id) return undefined;
+  try {
+    const meta = await getSessionMeta(id);
+    return meta.parent_id ? meta : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function isAgentToolMessage(message: Pick<Message, "tool_name" | "tool_metadata">): boolean {
   return message.tool_name === "Agent" || message.tool_metadata?.canonical_name === "Agent";
 }

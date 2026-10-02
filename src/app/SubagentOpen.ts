@@ -1,5 +1,5 @@
-import type { SessionRef } from "@/lib/types";
-import { matchesSubagentSession } from "@/lib/subagent";
+import type { SessionMeta, SessionRef } from "@/lib/types";
+import { findChildSessionById, matchesSubagentSession } from "@/lib/subagent";
 
 export interface OpenSubagentDetail {
   description?: string;
@@ -11,6 +11,7 @@ export interface OpenSubagentDetail {
 export interface OpenSubagentDeps {
   getActiveParentSessionIds: () => string[];
   getChildSessions: (parentId: string) => Promise<SessionRef[]>;
+  getSessionMeta: (sessionId: string) => Promise<SessionMeta>;
   openSession: (session: SessionRef) => void;
   onLoadFailed: () => void;
   onNotFound: () => void;
@@ -64,6 +65,12 @@ export async function openSubagent(detail: OpenSubagentDetail, deps: OpenSubagen
     } catch (error) {
       deps.onChildSessionLoadError?.(parentId, error);
     }
+  }
+
+  const byId = await findChildSessionById(detail.agentId, deps.getSessionMeta);
+  if (byId) {
+    deps.openSession(byId);
+    return;
   }
 
   if (!anyParentResolved && parentIds.length > 0) {

@@ -4,8 +4,8 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n/index";
 import { fmtTokens } from "@/lib/formatters";
-import { matchesSubagentSession, type SubagentMatchRequest } from "@/lib/subagent";
-import { getChildSessions, getSessionOpenWindow } from "@/lib/tauri";
+import { findChildSessionById, matchesSubagentSession, type SubagentMatchRequest } from "@/lib/subagent";
+import { getChildSessions, getSessionMeta, getSessionOpenWindow } from "@/lib/tauri";
 import type { Message, SessionMeta } from "@/lib/types";
 import { errorMessage } from "@/lib/errors";
 import { openSession } from "@/features/editor/editorGroups";
@@ -40,9 +40,9 @@ export function SubagentInline(props: {
     setError(null);
     try {
       const children = await getChildSessions(props.parentSessionId);
-      const match = children.find((candidate) =>
-        matchesSubagentSession(candidate, props.parentSessionId, props.request),
-      );
+      const match =
+        children.find((candidate) => matchesSubagentSession(candidate, props.parentSessionId, props.request)) ??
+        (await findChildSessionById(props.request.agentId, getSessionMeta));
       if (!match) {
         setError(t("toast.subagentNotFound"));
         return;

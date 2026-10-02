@@ -352,6 +352,10 @@ export async function getChildSessions(parentId: string): Promise<SessionMeta[]>
   return invokeCommand("get_child_sessions", { parentId });
 }
 
+export async function getSessionMeta(sessionId: string): Promise<SessionMeta> {
+  return invokeCommand("get_session_meta", { sessionId });
+}
+
 export async function getChildSessionCounts(parentIds: string[]): Promise<Record<string, number>> {
   return invokeCommand("get_child_session_counts", {
     parentIds,
